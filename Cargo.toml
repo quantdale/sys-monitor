@@ -1,0 +1,19 @@
+[package]
+name = "sys-monitor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.27"
+egui = "0.27"
+egui_plot = "0.27"
+sysinfo = "0.30"
+
+# Tells Windows not to open a console (black terminal) window behind the GUI.
+# Without this, you'd see a cmd.exe window pop up every time you launch the .exe.
+# This is the Rust equivalent of setting the "Subsystem" linker flag to WINDOWS.
+[profile.release]
+opt-level = 3         # Maximum compiler optimizations (like -O3 in C/C++)
+lto = true            # Link-Time Optimization: cross-crate inlining, shrinks binary
+codegen-units = 1     # One code-gen unit = better optimization, slower compile
+strip = true          # Strip debug symbols from release binary → smaller .exe
