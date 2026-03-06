@@ -59,6 +59,25 @@ use sysinfo::Disks;
 use sysinfo::Networks;
 
 // ---------------------------------------------------------------------------
+// PDH IMPORTS
+// ---------------------------------------------------------------------------
+// PDH = Performance Data Helper — the Win32 API Windows uses internally for all
+// hardware performance counters, including the GPU engine counters shown in
+// Task Manager. Using PDH directly (instead of WMI's PerfFormattedData wrapper)
+// gives us accurate baseline tracking and the same readings as Task Manager:
+//
+//   Task Manager:   PDH directly → GPU counter → accurate %
+//   Old WMI path:   WMI → PerfFormattedData → PDH internally → less accurate %
+//
+// The `windows` crate is Microsoft's official Rust bindings to the Win32 API.
+// It is maintained by Microsoft and already used internally by eframe.
+// We prefer it over third-party PDH crates for authoritativeness and version alignment.
+use windows::Win32::System::Performance::{
+    PdhAddEnglishCounterW, PdhCollectQueryData, PdhGetFormattedCounterArrayW,
+    PdhOpenQueryW, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE,
+};
+
+// ---------------------------------------------------------------------------
 // WHAT IS A VecDeque?
 // ---------------------------------------------------------------------------
 // VecDeque = "Vector Double-Ended Queue". Think of it like an array (Vec) but
@@ -174,14 +193,91 @@ struct SystemMonitor {
 
     // ── GPU UTILIZATION ─────────────────────────────────────────────────────────
     // We track iGPU (Intel integrated) and dGPU (discrete: NVIDIA/AMD) separately.
-    // On Windows, we query WMI for GPU Engine utilization percentage via the
-    // Win32_PerfFormattedData_Gpu3d_Gpu3dEngine class. iGPU typically reports
-    // as "Intel(R) UHD Graphics" or similar; dGPU as "NVIDIA GeForce RTX" etc.
+    // On Windows, we query WMI for GPU Engine utilization percentage via
+    // Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine — the same class
+    // that Windows Task Manager's GPU tab uses. iGPU typically reports as
+    // "Intel(R) UHD Graphics" or similar; dGPU as "NVIDIA GeForce RTX" etc.
     //
     // If a GPU is not present, its history remains empty (displays 0%).
     // Utilization is stored as a percentage (0.0 – 100.0).
     igpu_history: VecDeque<f64>, // Intel iGPU utilization % history
     dgpu_history: VecDeque<f64>, // Discrete GPU (NVIDIA/AMD) utilization % history
+
+    // ── GPU DEBUG FLAG ───────────────────────────────────────────────────────────
+    // When true, every raw WMI row returned by the GPU query is printed to stderr.
+    // Useful for diagnosing why GPU readings might be zero on a specific machine.
+    // Toggle off once GPU readings are confirmed working.
+    // To see output: run with `cargo run` in a terminal (not double-clicking .exe).
+    gpu_debug: bool,
+
+    // ── GPU ERROR FLAG ───────────────────────────────────────────────────────────
+    // When true, the first GPU error has already been printed to stderr.
+    // Prevents spamming the same "[GPU] WMI query failed" message every second.
+    gpu_error_logged: bool,
+
+    // ── WMI CONNECTION ───────────────────────────────────────────────────────────
+    // Persistent WMI connection used for all GPU counter queries.
+    //
+    // WHY PERSISTENT — RATE-BASED COUNTERS NEED TWO SAMPLES:
+    //   Win32_PerfFormattedData_* classes are rate-based performance counters.
+    //   Windows computes utilization as: (value₂ − value₁) / time_delta.
+    //   This delta is maintained PER-CONNECTION on the WMI provider side.
+    //   If we create a new WMIConnection on every poll, Windows discards the
+    //   previous baseline and starts over from zero — the delta is never computed
+    //   and every query returns 0, regardless of actual GPU load:
+    //
+    //     WRONG (new connection every poll):
+    //       Poll 1: new WMIConnection → sample 1 → baseline set → returns 0
+    //       Poll 2: new WMIConnection → sample 1 again → baseline discarded → 0
+    //       Poll 3: same → returns 0 forever
+    //
+    //     CORRECT (persistent connection, this implementation):
+    //       Poll 1: same WMIConnection → sample 1 → baseline set → returns 0
+    //       Poll 2: same WMIConnection → sample 2 → delta computed → real %
+    //       Poll 3: same WMIConnection → sample 3 → rolling delta → real %
+    //
+    //   This is the same reason Task Manager's GPU graph shows 0 for the first
+    //   second and then starts updating — it needs one baseline sample first.
+    //
+    //   CPU from sysinfo is unaffected: sysinfo manages its own persistent internal
+    //   state and handles the delta internally, so there is no equivalent issue.
+    //   Disk I/O and network rates from sysinfo are likewise handled internally.
+    //
+    // WHY Option<WMIConnection>:
+    //   Option<T> is Rust's equivalent of a nullable type (like `T | null` in
+    //   TypeScript). We initialize it once in new(); if that fails (rare, but
+    //   possible on some Windows configurations), we store None and show 0%
+    //   rather than panicking. The one-shot gpu_error_logged flag ensures the
+    //   error is printed once rather than every poll cycle.
+    wmi_con: Option<wmi::WMIConnection>,
+
+    // ── PDH GPU HANDLES ──────────────────────────────────────────────────────────
+    // PDH (Performance Data Helper) is the Win32 performance counter API that
+    // Windows Task Manager uses directly for GPU metrics.
+    //
+    // PDH LIFECYCLE — open once, never recreate mid-session:
+    //   1. PdhOpenQueryW          — creates a container for a group of counters
+    //   2. PdhAddEnglishCounterW  — registers counter paths (wildcard-enabled)
+    //   3. PdhCollectQueryData    — snapshots all counters atomically (every poll)
+    //   4. PdhGetFormattedCounterArrayW — reads per-instance formatted values
+    //
+    //   The baseline for computing utilization rates is maintained INTERNALLY by
+    //   the PDH query handle. Recreating the handle resets the baseline to zero,
+    //   causing the same always-zero problem that existed with WMI connections.
+    //
+    // PDH_HQUERY — opaque handle to a group of counters monitored together.
+    //   All counters in one query are snapshotted atomically by PdhCollectQueryData.
+    //   Think of it as a "query session" that tracks baseline state across polls.
+    //
+    // PDH_HCOUNTER — handle to one specific counter within a query.
+    //   Each counter uses a wildcard instance filter (e.g. `*engtype_3D*`) that PDH
+    //   expands to all matching per-process/per-adapter instances at collection time.
+    //
+    // Both are Option<> so the app degrades gracefully (shows 0%) if PDH init fails.
+    pdh_query: Option<isize>,
+    pdh_gpu_3d_counter: Option<isize>,    // \GPU Engine(*engtype_3D*)\Utilization Percentage
+    #[allow(dead_code)] // stored for future VideoDecode UI display; not yet read
+    pdh_gpu_video_counter: Option<isize>, // \GPU Engine(*engtype_VideoDecode*)\Utilization Percentage
 }
 
 impl SystemMonitor {
@@ -229,6 +325,18 @@ impl SystemMonitor {
         // reading we display is sensible rather than a large spike from boot stats.
         networks.refresh(false);
 
+        // Initialize PDH GPU counter handles once at startup.
+        // PDH (Performance Data Helper) — the same API Windows Task Manager uses.
+        // We open the query here so the handle persists for the app lifetime,
+        // enabling PDH to maintain its internal baseline for rate computation.
+        // new_pdh_gpu_query() also makes a first PdhCollectQueryData call to
+        // establish the baseline; real readings start on the second poll (~1s later).
+        let (pdh_query, pdh_gpu_3d_counter, pdh_gpu_video_counter) =
+            match new_pdh_gpu_query() {
+                Some((q, c3d, cvid)) => (Some(q), Some(c3d), cvid),
+                None => (None, None, None),
+            };
+
         SystemMonitor {
             system,
             // Pre-allocate VecDeques for the FULL 1-hour buffer (3600 data points).
@@ -258,6 +366,37 @@ impl SystemMonitor {
             net_sent_history: VecDeque::with_capacity(3600),
             igpu_history: VecDeque::with_capacity(3600),
             dgpu_history: VecDeque::with_capacity(3600),
+            gpu_debug: false, // set to true to print raw WMI rows to stderr
+            gpu_error_logged: false, // set to true after the first GPU error is logged
+
+            // Initialize the persistent WMI connection once at startup.
+            //
+            // assume_initialized() is required because eframe's windowing backend
+            // (winit) has already called CoInitializeEx(COINIT_APARTMENTTHREADED)
+            // on this thread before the app_creator closure (which calls new()) runs.
+            // COMLibrary::new() would call CoInitializeEx again with MTA, which
+            // Windows rejects with RPC_E_CHANGED_MODE (0x80010106).
+            //
+            // NOTE: The very first GPU poll after launch will still return 0% —
+            // this is CORRECT and EXPECTED. WMI PerfFormattedData requires one
+            // baseline sample before it can compute a utilization delta. Real
+            // readings begin on the second poll (~1 second after launch).
+            wmi_con: {
+                let com = unsafe { wmi::COMLibrary::assume_initialized() };
+                match wmi::WMIConnection::new(com) {
+                    Ok(con) => {
+                        eprintln!("[WMI] Connection initialized successfully.");
+                        Some(con)
+                    }
+                    Err(e) => {
+                        eprintln!("[WMI] Failed to initialize connection: {:?}. GPU metrics unavailable.", e);
+                        None
+                    }
+                }
+            },
+            pdh_query,
+            pdh_gpu_3d_counter,
+            pdh_gpu_video_counter,
         }
     }
 
@@ -394,10 +533,12 @@ impl SystemMonitor {
         Self::push_history(&mut self.net_sent_history, sent_kbs, self.max_history);
 
         // ── GPU UTILIZATION REFRESH ──────────────────────────────────────────
-        // Query WMI for GPU Engine utilization. We separate iGPU (Intel integrated)
-        // and dGPU (discrete: NVIDIA/AMD) based on the GPU name.
-        // If the WMI query fails or no GPU is found, we default to 0%.
-        let (igpu_util, dgpu_util) = Self::query_gpu_utilization();
+        // Query PDH for GPU Engine utilization. Uses PDH (Performance Data Helper)
+        // directly — the same API Windows Task Manager uses for its GPU graphs.
+        // We separate iGPU (Intel integrated) and dGPU (discrete: NVIDIA/AMD)
+        // based on the LUID-to-vendor map from Win32_VideoController.
+        // If PDH init failed or no GPU is found, we default to 0%.
+        let (igpu_util, dgpu_util) = self.query_gpu_utilization_pdh();
         Self::push_history(&mut self.igpu_history, igpu_util, self.max_history);
         Self::push_history(&mut self.dgpu_history, dgpu_util, self.max_history);
     }
@@ -412,114 +553,674 @@ impl SystemMonitor {
     }
 
     // ---------------------------------------------------------------------------
-    // GPU UTILIZATION HELPER — Query WMI for GPU Engine utilization percentage
+    // GPU VENDOR MAP — Build a LUID-to-vendor-name map from Win32_VideoController
     // ---------------------------------------------------------------------------
-    // On Windows, we query WMI for GPU utilization. This is the same data source
-    // that Windows Task Manager and Performance Monitor use under the hood.
+    // Win32_VideoController gives adapter names (Intel, NVIDIA, AMD) but no LUIDs.
+    // Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine gives LUIDs but no names.
     //
-    // Returns: (igpu_util, dgpu_util) where:
-    //   igpu_util = Intel iGPU utilization % (0.0–100.0), or 0.0 if not found
-    //   dgpu_util = Discrete GPU utilization % (0.0–100.0), or 0.0 if not found
+    // We bridge the gap with a heuristic: collect unique LUIDs from the engine class,
+    // sort them alphabetically (Windows assigns LUIDs at PCI enumeration time, and the
+    // LUID hex values sort consistently with that order), then match positionally to
+    // VideoController entries in their own enumeration order.
     //
-    // We split iGPU vs dGPU by checking the GPU name:
-    //   - iGPU: "Intel" in the description (Intel(R) UHD, Iris Xe, etc.)
-    //   - dGPU: "NVIDIA" or "AMD" in the description
-    fn query_gpu_utilization() -> (f64, f64) {
-        // Initialize COM for WMI (required on Windows for WMI queries).
-        // WMI is the Windows Management Instrumentation subsystem, exposed via COM.
-        let com_lib = match wmi::COMLibrary::new() {
-            Ok(lib) => lib,
-            Err(_) => return (0.0, 0.0),
-        };
+    // For the common laptop config (1 iGPU + 1 dGPU) and for desktops (1 GPU) this
+    // mapping is reliable. Systems with 3+ GPUs would need the D3DKMT API for an exact
+    // match, but that requires unsafe FFI — out of scope for this monitoring app.
+    fn build_gpu_vendor_map(
+        &self,
+        wmi_con: &wmi::WMIConnection,
+    ) -> std::collections::HashMap<String, String> {
+        use std::collections::{HashMap, HashSet};
 
-        let wmi_con = match wmi::WMIConnection::new(com_lib) {
-            Ok(con) => con,
-            Err(_) => return (0.0, 0.0),
-        };
-
-        // Try multiple WMI queries for GPU data, in order of preference.
-        // Some systems may have different GPU counter configurations.
-        let queries = vec![
-            // Standard 3D GPU Engine utilization (most common on modern Windows)
-            "SELECT Name, UtilizationPercentage FROM Win32_PerfFormattedData_Gpu3d_Gpu3dEngine",
-            // Raw data counter variant
-            "SELECT Name FROM Win32_PerfRawData_Gpu3d_Gpu3dEngine",
-            // Try querying from the root\cimv2 namespace explicitly
-            "SELECT * FROM Win32_PerfFormattedData_Gpu3d_Gpu3dEngine WHERE UtilizationPercentage > 0",
-        ];
-
-        for query in queries {
-            let results: Vec<std::collections::HashMap<String, String>> = match wmi_con.raw_query(query) {
-                Ok(res) => res,
-                Err(_) => continue, // Try next query
-            };
-
-            if results.is_empty() {
-                continue; // No results, try next query
+        // --- Step 1: collect ordered unique LUID prefixes from GPUEngine rows ---
+        // Name format: "luid_0xHIGH_0xLOW_phys_P_eng_E_engtype_T"
+        // We extract the LUID prefix: "luid_0xHIGH_0xLOW"
+        //
+        // We use HashMap<String, wmi::Variant> (instead of HashMap<String, String>)
+        // because WMI fields can be integers, booleans, etc. — not all strings.
+        // Deserializing into String when the wire type is an integer causes a
+        // SerdeError. Variant holds any WMI type and lets us extract the value
+        // via pattern matching on the concrete Variant arm.
+        let luid_rows = match wmi_con.raw_query::<HashMap<String, wmi::Variant>>(
+            "SELECT Name FROM Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine",
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[GPU] build_gpu_vendor_map: LUID enumeration failed: {:?}", e);
+                return HashMap::new();
             }
+        };
 
-            // Successfully got GPU data. Parse it.
-            let (mut igpu_max, mut dgpu_max) = (0.0_f64, 0.0_f64);
-
-            for row in results {
-                // Extract Name and UtilizationPercentage fields if they exist.
-                // For formatted data, UtilizationPercentage should be present.
-                // For raw data, we may only have Name (and would need different logic).
-                let name = row.get("Name")
-                    .map(|s| s.as_str())
-                    .unwrap_or("")
-                    .to_uppercase();
-
-                // Try to parse UtilizationPercentage. If not available (raw data),
-                // default to checking if GPU was found (we'll show non-zero indicator).
-                let util: f64 = row.get("UtilizationPercentage")
-                    .and_then(|u_str| u_str.parse().ok())
-                    .unwrap_or_else(|| {
-                        // For raw data queries, if we have a GPU name, assume it's active.
-                        if name.contains("INTEL") || name.contains("NVIDIA") || 
-                           name.contains("AMD") || name.contains("RADEON") {
-                            1.0 // Fallback: show 1% to indicate GPU exists
-                        } else {
-                            0.0
-                        }
-                    });
-
-                // Categorize by GPU vendor.
-                if name.contains("INTEL") {
-                    igpu_max = igpu_max.max(util);
-                } else if name.contains("NVIDIA") || name.contains("AMD") || name.contains("RADEON") {
-                    dgpu_max = dgpu_max.max(util);
+        let mut luid_set: HashSet<String> = HashSet::new();
+        for row in &luid_rows {
+            if let Some(wmi::Variant::String(name)) = row.get("Name") {
+                // Use the shared LUID extractor — handles both pid_N_luid_... and
+                // bare luid_... Name formats. Returns e.g. "0x00017D0F".
+                if let Some(luid) = extract_luid_from_name(name) {
+                    luid_set.insert(luid);
                 }
             }
+        }
+        let mut luids: Vec<String> = luid_set.into_iter().collect();
+        luids.sort(); // alphabetical sort of hex strings gives the same order as PCI enumeration
 
-            // If either GPU was found and we got data, return it.
-            if igpu_max > 0.0 || dgpu_max > 0.0 {
-                return (igpu_max, dgpu_max);
+        // --- Step 2: enumerate VideoControllers for vendor names ---
+        let vc_rows = match wmi_con.raw_query::<HashMap<String, wmi::Variant>>(
+            "SELECT Caption FROM Win32_VideoController",
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[GPU] build_gpu_vendor_map: VideoController query failed: {:?}", e);
+                return HashMap::new();
+            }
+        };
+
+        // --- Step 3: match LUID[i] → VideoController[i] by index (positional heuristic) ---
+        let mut map: HashMap<String, String> = HashMap::new();
+        for (i, luid) in luids.iter().enumerate() {
+            if let Some(vc) = vc_rows.get(i) {
+                let caption = match vc.get("Caption") {
+                    Some(wmi::Variant::String(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                map.insert(luid.clone(), caption);
             }
         }
 
-        // All queries returned empty. GPUs may not be exposing WMI counters.
-        // Try a fallback: query for video controllers just to detect if GPUs exist.
-        // This helps distinguish between "no GPU" and "GPU exists but no utilization data".
-        let _gpu_exists: bool = match wmi_con.raw_query::<std::collections::HashMap<String, String>>(
-            "SELECT Name FROM Win32_VideoController"
-        ) {
-            Ok(results) => {
-                // If we have video controllers, check if any are Intel/NVIDIA/AMD
-                results.iter().any(|gpu| {
-                    let name = gpu.get("Name").map(|s| s.as_str()).unwrap_or("").to_uppercase();
-                    name.contains("INTEL") || name.contains("NVIDIA") || name.contains("AMD") || name.contains("RADEON")
-                })
+        if self.gpu_debug {
+            eprintln!("[GPU DEBUG] Vendor map: {:?}", map);
+        }
+        map
+    }
+
+    // ---------------------------------------------------------------------------
+    // GPU PERF COUNTERS — Query live 3D-engine utilization from GPUPerformanceCounters
+    // ---------------------------------------------------------------------------
+    // Returns Vec<(luid_prefix, util_pct)> — one entry per matching engine row.
+    //
+    // WHY GPUPerformanceCounters specifically:
+    //   Windows Task Manager's GPU tab reads
+    //   Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine — NOT the older
+    //   Gpu3d_Gpu3dEngine class. The GPUPerformanceCounters provider is registered
+    //   by display drivers on Windows 10+, and it is the authoritative source for
+    //   per-adapter, per-engine GPU utilization counters.
+    //
+    // WHAT IS A LUID:
+    //   Locally Unique Identifier — a 64-bit value Windows assigns to each GPU
+    //   adapter at runtime (renewed on every boot). It is Windows' canonical way
+    //   of referring to a GPU without relying on PCI bus addresses, which can
+    //   change if PCI enumeration order changes. The LUID appears in the Name
+    //   field as "pid_N_luid_0x<HIGH>_0x<LOW>_phys_P_eng_E_engtype_T".
+    //
+    // WHY WE SUM ACROSS ALL PIDs:
+    //   WMI returns ONE row per process per engine per GPU. Any single process
+    //   rarely shows significant utilization on its own. To get the total GPU
+    //   load (matching what Task Manager shows), we must SUM UtilizationPercentage
+    //   across all rows sharing the same LUID and engine type, regardless of PID.
+    //
+    //   Example:
+    //     pid_1234_luid_0x17D0F_engtype_3D → 2%
+    //     pid_5678_luid_0x17D0F_engtype_3D → 8%
+    //     pid_9012_luid_0x17D0F_engtype_3D → 15%
+    //                                      ──────
+    //     Total 3D utilization for 0x17D0F → 25%  ← this is what the graph shows
+    //
+    // WHY WE CAP AT 100%:
+    //   After summing, multi-engine GPUs can exceed 100% because the 3D engine may
+    //   be subdivided into multiple hardware queues. Capping at 100 keeps the graph
+    //   and percentage display in a sensible range.
+    //
+    // WHY WE ALSO TRACK VideoDecode:
+    //   Video decoding (H.264/HEVC/AV1) is a separate fixed-function engine.
+    //   It won't appear in engtype_3D numbers, but it's real GPU load.
+    //   We accumulate it separately for future UI display.
+    //
+    // Returns (3d_totals, video_totals):
+    //   3d_totals:    Vec<(luid, summed_3D_util%)>    — one entry per unique LUID
+    //   video_totals: Vec<(luid, summed_video_util%)>  — one entry per unique LUID
+    #[allow(dead_code)] // preserved WMI fallback; PDH is now the primary GPU source
+    fn query_gpu_perf_counters(
+        &mut self,
+        wmi_con: &wmi::WMIConnection,
+    ) -> (Vec<(String, f64)>, Vec<(String, f64)>) {
+        // Fetch ALL engine rows (no WHERE filter) so we can accumulate both
+        // 3D and VideoDecode engines in a single pass.
+        let query = "SELECT Name, UtilizationPercentage \
+                     FROM Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine";
+
+        let rows = match wmi_con.raw_query::<std::collections::HashMap<String, wmi::Variant>>(query) {
+            Ok(r) => r,
+            Err(e) => {
+                if !self.gpu_error_logged {
+                    eprintln!("[GPU] WMI query failed: {:?}", e);
+                    eprintln!("[GPU] GPUPerformanceCounters class not found. \
+                               GPU drivers may not expose WMI performance counters \
+                               on this system (virtual machine, old driver, or WDDM < 2.0).");
+                    self.gpu_error_logged = true;
+                }
+                return (vec![], vec![]);
             }
-            Err(_) => false,
         };
 
-        // If GPUs exist but WMI performance counters aren't available, this is likely due to:
-        //   - GPU drivers not exposing performance counters via WMI
-        //   - Windows Performance Monitor GPU counters not enabled
-        //   - Running in a virtual machine or remote session
-        // We return 0.0 in this case, but could log a message if error reporting was enabled.
-        (0.0, 0.0)
+        if rows.is_empty() {
+            if !self.gpu_error_logged {
+                eprintln!("[GPU] WMI query returned no results. \
+                           Class may not exist on this Windows version.");
+                self.gpu_error_logged = true;
+            }
+            return (vec![], vec![]);
+        }
+
+        // Accumulate utilization per LUID across all PIDs.
+        // Key:   LUID string (e.g. "0x00017D0F")
+        // Value: summed utilization % across all processes for that engine type
+        let mut luid_3d_totals: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        let mut luid_video_totals: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+
+        for row in &rows {
+            if self.gpu_debug {
+                eprintln!("[GPU DEBUG] Row: {:?}", row);
+            }
+
+            let name = match row.get("Name") {
+                Some(wmi::Variant::String(s)) => s.clone(),
+                _ => continue,
+            };
+
+            // Determine which engine type this row represents.
+            // We only care about 3D (shader workload) and VideoDecode (HW decode).
+            let is_3d = name.contains("engtype_3D");
+            let is_video = name.contains("engtype_VideoDecode");
+            if !is_3d && !is_video {
+                continue; // Skip Copy, Compute, VR, OFA, GDI Render, etc.
+            }
+
+            // Extract the LUID from the Name string using the shared helper.
+            let luid = match extract_luid_from_name(&name) {
+                Some(l) => l,
+                None => continue,
+            };
+
+            // UtilizationPercentage is returned as an integer by WMI drivers (UI4/UI8).
+            // We match all numeric Variant arms and cast to f64.  The String arm covers
+            // the rare case where an older driver serialises it as a string.
+            let util: f64 = match row.get("UtilizationPercentage") {
+                Some(wmi::Variant::UI4(n))  => *n as f64,
+                Some(wmi::Variant::UI8(n))  => *n as f64,
+                Some(wmi::Variant::I4(n))   => *n as f64,
+                Some(wmi::Variant::I8(n))   => *n as f64,
+                Some(wmi::Variant::R8(n))   => *n,
+                Some(wmi::Variant::R4(n))   => *n as f64,
+                Some(wmi::Variant::String(s)) => s.parse::<f64>().unwrap_or(0.0),
+                _ => 0.0,
+            };
+
+            // SUM across all PIDs for this LUID — this is the critical aggregation fix.
+            // Before this fix, we were keeping individual per-row values and taking max(),
+            // which showed near-zero because any single process rarely uses much GPU alone.
+            if is_3d {
+                *luid_3d_totals.entry(luid).or_insert(0.0) += util;
+            } else {
+                *luid_video_totals.entry(luid).or_insert(0.0) += util;
+            }
+        }
+
+        // Cap each LUID total at 100% — summing across many processes and engine
+        // instances can exceed 100 on multi-engine GPUs.
+        let capped_3d: Vec<(String, f64)> = luid_3d_totals
+            .into_iter()
+            .map(|(luid, total)| (luid, total.min(100.0)))
+            .collect();
+
+        let capped_video: Vec<(String, f64)> = luid_video_totals
+            .into_iter()
+            .map(|(luid, total)| (luid, total.min(100.0)))
+            .collect();
+
+        if self.gpu_debug {
+            eprintln!("[GPU DEBUG] 3D totals (summed, capped): {:?}", capped_3d);
+            eprintln!("[GPU DEBUG] Video totals (summed, capped): {:?}", capped_video);
+        }
+
+        (capped_3d, capped_video)
+    }
+
+    // ---------------------------------------------------------------------------
+    // GPU UTILIZATION — Main entry point: returns (igpu_util%, dgpu_util%)
+    // ---------------------------------------------------------------------------
+    // Orchestrates build_gpu_vendor_map() and query_gpu_perf_counters(), then
+    // classifies each engine row as iGPU (Intel) or dGPU (NVIDIA/AMD) and returns
+    // the maximum utilization seen in each category.
+    //
+    // Returns: (igpu_util, dgpu_util) in the 0.0–100.0 range.
+    //   Both values are 0.0 if the GPU is idle, absent, or counters unavailable.
+    #[allow(dead_code)] // preserved WMI fallback; PDH is now the primary GPU source
+    fn query_gpu_utilization(&mut self) -> (f64, f64) {
+        // Temporarily move the WMIConnection out of self so we can pass it by
+        // reference to the helpers while also calling &mut self methods.
+        //
+        // WHY take() / put-back pattern:
+        //   Rust's borrow checker prevents holding a shared borrow into self.wmi_con
+        //   (&WMIConnection) while simultaneously calling &mut self methods.
+        //   Option::take() moves the value out of self.wmi_con (setting it to None),
+        //   so the field is no longer borrowed and &mut self calls are allowed.
+        //   We restore the connection into self.wmi_con before returning so the
+        //   NEXT poll has the persistent baseline needed to compute a delta.
+        let wmi_con = match self.wmi_con.take() {
+            Some(con) => con,
+            None => {
+                // WMI connection was never established (init failed in new()).
+                // Error already printed once at startup — return silent zeros.
+                return (0.0, 0.0);
+            }
+        };
+
+        // Step 1: LUID → vendor name map (Win32_VideoController, name lookup only).
+        // Win32_VideoController is a STATIC info class — it has GPU name, driver
+        // version, VRAM size. It has NO utilization data and must never be used
+        // as a utilization source. It is only used here to identify vendor names.
+        let vendor_map = self.build_gpu_vendor_map(&wmi_con);
+
+        // Step 2: live utilization (summed across all PIDs) from GPUPerformanceCounters.
+        // Returns two vecs: 3D engine totals and VideoDecode engine totals per LUID.
+        //
+        // FIRST POLL NOTE: the first call after app launch will return 0% for all LUIDs.
+        // This is CORRECT and EXPECTED. WMI PerfFormattedData requires one baseline
+        // sample before it can compute a utilization delta. Real readings begin on
+        // the second poll (~1 second after launch).
+        let (utilization_3d, _utilization_video) = self.query_gpu_perf_counters(&wmi_con);
+
+        // Restore the connection — must happen before any early returns below.
+        // Without this, self.wmi_con stays None and every subsequent poll returns
+        // (0.0, 0.0), defeating the persistent-connection fix entirely.
+        self.wmi_con = Some(wmi_con);
+
+        // Step 3: classify each LUID as iGPU or dGPU using vendor keywords + fallback.
+        // Take the MAX across all same-class GPUs: if both Intel LUIDs are iGPU,
+        // we show the busier one (the Xe adapter doing 3D work, not the GDI adapter).
+        let mut igpu_max = 0.0f64;
+        let mut dgpu_max = 0.0f64;
+
+        for (luid, util) in &utilization_3d {
+            match classify_luid(luid, &vendor_map) {
+                GpuClass::IGpu => igpu_max = igpu_max.max(*util),
+                GpuClass::DGpu => dgpu_max = dgpu_max.max(*util),
+                GpuClass::Unknown => {
+                    if !self.gpu_error_logged {
+                        eprintln!("[GPU] Unclassified LUID: {} (util={:.1}%)", luid, util);
+                    }
+                }
+            }
+        }
+
+        if self.gpu_debug {
+            eprintln!(
+                "[GPU DEBUG] Final: igpu_max={:.1}%, dgpu_max={:.1}%, vendor_map={:?}",
+                igpu_max, dgpu_max, vendor_map
+            );
+        }
+
+        (igpu_max, dgpu_max)
+    }
+
+    // ---------------------------------------------------------------------------
+    // GPU UTILIZATION — PDH-based entry point: returns (igpu_util%, dgpu_util%)
+    // ---------------------------------------------------------------------------
+    // Uses PDH (Performance Data Helper) directly — the same API Windows Task
+    // Manager uses for its GPU graphs. PDH gives more accurate readings than WMI
+    // because it manages its own per-query-handle baseline for rate computation.
+    //
+    // WHY PDH INSTEAD OF WMI:
+    //   Task Manager uses PDH directly. WMI's Win32_PerfFormattedData classes are
+    //   a higher-level wrapper that queries PDH internally, adding an abstraction
+    //   layer that introduces inaccuracy. For performance counters, PDH is always
+    //   the authoritative source.
+    //
+    // PDH LIFECYCLE SUMMARY (see struct fields for full explanation):
+    //   PdhOpenQuery (once) → PdhAddEnglishCounter (once) → every poll:
+    //     PdhCollectQueryData → PdhGetFormattedCounterArrayW → read values
+    //
+    // WHY unsafe:
+    //   PDH is a C Win32 API. Rust's `unsafe` block is required at any FFI
+    //   (Foreign Function Interface) boundary — calling native C code from Rust.
+    //   `unsafe` means "I take responsibility for correctness here" (pointer
+    //   validity, alignment, lifetime). It does NOT mean the code is wrong.
+    //
+    // WHY FIRST POLL RETURNS 0%:
+    //   PDH computes utilization as: (value₂ − value₁) / time_delta.
+    //   The first PdhCollectQueryData (called in new_pdh_gpu_query at startup)
+    //   establishes value₁ (the baseline). This function's first call computes
+    //   the first real delta. Identical to Task Manager showing 0 on first second.
+    fn query_gpu_utilization_pdh(&mut self) -> (f64, f64) {
+        let query = match self.pdh_query {
+            Some(q) => q,
+            None => return (0.0, 0.0), // PDH init failed at startup
+        };
+        let counter_3d = match self.pdh_gpu_3d_counter {
+            Some(c) => c,
+            None => return (0.0, 0.0),
+        };
+
+        // Build the LUID → vendor name map for iGPU/dGPU classification.
+        // Uses the take/put-back pattern on self.wmi_con so we can call a
+        // &mut self method (build_gpu_vendor_map) while wmi_con is live.
+        // WMI is only used here for static Win32_VideoController name lookup.
+        let vendor_map = match self.wmi_con.take() {
+            Some(con) => {
+                let map = self.build_gpu_vendor_map(&con);
+                self.wmi_con = Some(con);
+                map
+            }
+            None => std::collections::HashMap::new(),
+        };
+
+        let mut luid_3d_totals: std::collections::HashMap<String, f64> =
+            std::collections::HashMap::new();
+
+        // SAFETY: All Win32 PDH function calls via FFI.
+        //   • PDH_HQUERY / PDH_HCOUNTER are opaque scalar handles (safe to copy)
+        //   • Mutable pointer arguments (&mut buf_size, etc.) point to stack variables
+        //   • The backing buffer is heap-allocated with u64 alignment (8 bytes),
+        //     sufficient for PDH_FMT_COUNTERVALUE_ITEM_W which contains an f64 union
+        //   • We verify return codes before reading any output data
+        //   • szName pointers in PDH_FMT_COUNTERVALUE_ITEM_W point into the same
+        //     backing buffer, which stays alive for the duration of this unsafe block
+        unsafe {
+            // Collect a fresh sample — PDH computes (new − old) / time_delta internally.
+            // This gives us the rate since the previous PdhCollectQueryData call.
+            // On the very first call after PdhOpenQuery the baseline is set; real
+            // percentages start appearing from the second call onward.
+            if PdhCollectQueryData(query) != 0 {
+                if !self.gpu_error_logged {
+                    eprintln!("[PDH] PdhCollectQueryData failed — GPU readings unavailable.");
+                    self.gpu_error_logged = true;
+                }
+                return (0.0, 0.0);
+            }
+
+            // --- Probe call: determine the required buffer size ---
+            // PdhGetFormattedCounterArrayW with a null instance buffer returns
+            // PDH_MORE_DATA (a "failure") but populates buf_size and item_count.
+            // We intentionally ignore the return value of this probe call.
+            //
+            // PDH_FMT_DOUBLE (0x200) requests values as f64 in the 0.0–100.0 range.
+            let mut buf_size: u32 = 0;
+            let mut item_count: u32 = 0;
+            let _ = PdhGetFormattedCounterArrayW(
+                counter_3d,
+                PDH_FMT_DOUBLE,
+                &mut buf_size,
+                &mut item_count,
+                None,
+            );
+
+            if item_count == 0 {
+                // No GPU Engine instances matched the wildcard.
+                // Expected on the first poll (no baseline yet), or on systems
+                // without GPU hardware counters (VMs, old drivers). Return 0% quietly.
+                return (0.0, 0.0);
+            }
+
+            // --- Allocate backing buffer with guaranteed 8-byte alignment ---
+            // PDH_FMT_COUNTERVALUE_ITEM_W contains a union field with an f64 member,
+            // which requires 8-byte alignment. Vec<u8> only guarantees 1-byte alignment.
+            // Vec<u64> guarantees 8-byte alignment and is safe to reinterpret as the
+            // target struct because:
+            //   • We only READ through the typed pointer (no aliased writes)
+            //   • Both types are POD (no Drop, no invalid bit patterns)
+            //   • We allocate enough bytes (with a 3× safety margin for new processes
+            //     that may have started between the probe call and this data call)
+            let u64_count = (buf_size as usize * 3 + 7) / 8;
+            let mut backing: Vec<u64> = vec![0u64; u64_count];
+            let mut actual_buf_size: u32 = (u64_count * 8) as u32;
+            let buf_ptr = backing.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_W;
+
+            // --- Data call: fill buffer with one entry per matched GPU engine instance ---
+            // Instance name format (same as WMI Name field):
+            //   "pid_1234_luid_0x00000000_0x00017D0F_phys_0_eng_0_engtype_3D"
+            // We use extract_luid_from_name() to get the LUID from each instance.
+            let status = PdhGetFormattedCounterArrayW(
+                counter_3d,
+                PDH_FMT_DOUBLE,
+                &mut actual_buf_size,
+                &mut item_count,
+                Some(buf_ptr),
+            );
+
+            if status != 0 {
+                // PDH_CSTATUS_INVALID_DATA is expected on the very first call
+                // (no baseline yet). Subsequent calls return valid data.
+                return (0.0, 0.0);
+            }
+
+            // Iterate over instances, extract LUID, accumulate utilization.
+            for i in 0..item_count as usize {
+                let item: &PDH_FMT_COUNTERVALUE_ITEM_W = &*buf_ptr.add(i);
+
+                // PDH_CSTATUS_VALID_DATA = 0x0, PDH_CSTATUS_NEW_DATA = 0x1.
+                // Any other status means this instance has no valid data this cycle.
+                if item.FmtValue.CStatus > 1 {
+                    continue;
+                }
+
+                // Convert PWSTR instance name to a Rust String.
+                // szName points into the same backing buffer allocation, which is
+                // kept alive for the duration of this unsafe block.
+                let name = match item.szName.to_string() {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+
+                if self.gpu_debug {
+                    eprintln!("[PDH DEBUG] instance: {}", name);
+                }
+
+                // Extract LUID using the same helper as the WMI pipeline.
+                // PDH and WMI share the same counter infrastructure and the same
+                // instance name format, so this helper works for both.
+                let luid = match extract_luid_from_name(&name) {
+                    Some(l) => l,
+                    None => continue,
+                };
+
+                // doubleValue is valid because we requested PDH_FMT_DOUBLE above.
+                // Accessing the union requires unsafe — we are already in an unsafe block.
+                let util = item.FmtValue.Anonymous.doubleValue.clamp(0.0, 100.0);
+
+                // SUM utilization across all processes for this LUID.
+                // Each instance is one process's contribution to the total GPU load.
+                *luid_3d_totals.entry(luid).or_insert(0.0) += util;
+            }
+        }
+
+        // Classify each LUID as iGPU or dGPU and take the max per class.
+        // Capping at 100% handles multi-engine GPUs where summing can exceed 100.
+        let mut igpu_max = 0.0f64;
+        let mut dgpu_max = 0.0f64;
+
+        for (luid, total) in luid_3d_totals {
+            let capped = total.min(100.0);
+            match classify_luid(&luid, &vendor_map) {
+                GpuClass::IGpu => igpu_max = igpu_max.max(capped),
+                GpuClass::DGpu => dgpu_max = dgpu_max.max(capped),
+                GpuClass::Unknown => {
+                    if !self.gpu_error_logged {
+                        eprintln!("[PDH] Unclassified LUID: {} (util={:.1}%)", luid, capped);
+                    }
+                }
+            }
+        }
+
+        if self.gpu_debug {
+            eprintln!(
+                "[PDH DEBUG] Final: igpu_max={:.1}%, dgpu_max={:.1}%",
+                igpu_max, dgpu_max
+            );
+        }
+
+        (igpu_max, dgpu_max)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PDH INITIALIZATION HELPER
+// ---------------------------------------------------------------------------
+
+/// Open a PDH query and register GPU engine utilization counters once at startup.
+///
+/// Returns `Some((query, counter_3d, counter_video_opt))` on success.
+/// Returns `None` if the query or 3D counter cannot be opened (GPU tracking disabled).
+/// `counter_video_opt` is `None` if the VideoDecode counter is unavailable (non-fatal).
+///
+/// **Why open once:**
+///   PDH rate-based counters (Win32_PerfFormattedData_* counters) track utilization as
+///   a delta between two `PdhCollectQueryData` calls: `(value₂ − value₁) / time_delta`.
+///   This baseline is stored INSIDE the query handle. Recreating the handle on every
+///   poll discards the baseline and always returns 0% — the identical bug that existed
+///   in the previous WMI approach.
+///
+/// **`unsafe` explanation:**
+///   PDH is a Win32 C API. `unsafe` is required for any FFI (Foreign Function Interface)
+///   call to C code because the Rust compiler cannot verify the safety of foreign code.
+///   Here we ensure safety manually: all pointer arguments are valid stack variables or
+///   properly aligned heap allocations, and we check all return codes.
+fn new_pdh_gpu_query() -> Option<(isize, isize, Option<isize>)> {
+    // SAFETY: PDH C API calls via FFI. All mutable pointer arguments are stack variables.
+    // Return codes are checked before any output values are read.
+    unsafe {
+        let mut query: isize = 0;
+
+        // PdhOpenQueryW: creates the query container.
+        //   • First arg (None): live system data, not a log file
+        //   • Second arg (0): no callback userdata needed
+        //   • Third arg: receives the allocated query handle
+        if PdhOpenQueryW(None, 0, &mut query) != 0 {
+            eprintln!("[PDH] PdhOpenQueryW failed — GPU metrics unavailable.");
+            return None;
+        }
+
+        // PdhAddEnglishCounterW: registers a counter path using English names,
+        // regardless of the system's display locale. This ensures the path
+        // `\GPU Engine(*engtype_3D*)\Utilization Percentage` resolves correctly
+        // on French, German, Chinese, etc. Windows installations.
+        //
+        // Counter path format:  \ObjectName(InstanceFilter)\CounterName
+        //   \GPU Engine          — the PDH performance object (driver-registered)
+        //   (*engtype_3D*)       — wildcard instance filter: all 3D engine instances
+        //                          across all processes and all GPU adapters
+        //   \Utilization Percentage — the specific counter within that object
+        //
+        // The wildcard (*) is resolved at PdhCollectQueryData time, not here.
+        // Every process with a loaded 3D engine will produce a separate instance.
+        let path_3d =
+            windows::core::w!(r"\GPU Engine(*engtype_3D*)\Utilization Percentage");
+        let mut counter_3d: isize = 0;
+        if PdhAddEnglishCounterW(query, path_3d, 0, &mut counter_3d) != 0 {
+            eprintln!("[PDH] Failed to add GPU 3D counter — GPU metrics unavailable.");
+            return None;
+        }
+
+        // VideoDecode counter — hardware video decode (H.264/HEVC/AV1) load.
+        // This is a separate fixed-function engine; video playback won't appear
+        // in 3D % numbers. Non-fatal: if unavailable we skip it and continue.
+        let path_video = windows::core::w!(
+            r"\GPU Engine(*engtype_VideoDecode*)\Utilization Percentage"
+        );
+        let mut counter_video: isize = 0;
+        let counter_video_opt =
+            if PdhAddEnglishCounterW(query, path_video, 0, &mut counter_video) == 0 {
+                Some(counter_video)
+            } else {
+                eprintln!("[PDH] VideoDecode counter unavailable — video GPU tracking disabled.");
+                None
+            };
+
+        // First PdhCollectQueryData — establishes the sample baseline.
+        // This call stores value₁ for every matched instance. The NEXT call
+        // (first actual poll ~1 second after app start) will compute value₂ − value₁
+        // and return real utilization percentages.
+        // The first call always "returns" 0% — this is correct, not a bug.
+        let _ = PdhCollectQueryData(query);
+
+        eprintln!("[PDH] GPU counters initialized successfully.");
+        Some((query, counter_3d, counter_video_opt))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GPU CLASSIFICATION HELPERS — standalone functions used by the GPU pipeline
+// ---------------------------------------------------------------------------
+
+/// Classifies a GPU LUID as integrated or discrete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GpuClass {
+    IGpu,
+    DGpu,
+    Unknown,
+}
+
+/// Extract the LUID hex string from a WMI GPUEngine `Name` field.
+///
+/// The WMI `Name` field can appear in two formats depending on the Windows version:
+///   New (W10 20H2+): `"pid_1234_luid_0x00000000_0x00017D0F_phys_0_eng_0_engtype_3D"`
+///   Old (legacy):    `"luid_0x00000000_0x00017D0F_phys_0_eng_0_engtype_3D"`
+///
+/// We want the *second* hex segment after `luid_` — e.g. `"0x00017D0F"`.
+/// The first segment (`0x00000000`) is the high 32 bits of the LUID, which is
+/// always zero on current Windows and carries no distinguishing information.
+fn extract_luid_from_name(name: &str) -> Option<String> {
+    // Try splitting on "_luid_" first (handles the pid_N_luid_... format).
+    // If the name starts with "luid_" (no pid prefix), the split won't match
+    // because there's no underscore before "luid". Handle that as a fallback.
+    let after_luid = if let Some(pos) = name.find("_luid_") {
+        // Skip past "_luid_" (6 chars)
+        &name[pos + 6..]
+    } else if name.starts_with("luid_") {
+        // Legacy format: strip the "luid_" prefix (5 chars)
+        &name[5..]
+    } else {
+        return None;
+    };
+
+    // after_luid is now "0x00000000_0x00017D0F_phys_..."
+    // Split into at most 3 parts: ["0x00000000", "0x00017D0F", "phys_..."]
+    let parts: Vec<&str> = after_luid.splitn(3, '_').collect();
+    if parts.len() >= 2 && parts[1].starts_with("0x") {
+        Some(parts[1].to_string())
+    } else {
+        None
+    }
+}
+
+/// Classify a LUID as iGPU or dGPU.
+///
+/// **Primary:** keyword match on the vendor caption from `Win32_VideoController`.
+/// This works on any machine where the positional LUID↔VideoController mapping is correct.
+///
+/// **Fallback:** hardcoded LUIDs known from the developer's machine. LUIDs are
+/// assigned per-boot by Windows but tend to stay stable across reboots unless
+/// the GPU driver is reinstalled. These values are machine-specific and serve as
+/// a safety net when the vendor map is incomplete or misordered.
+fn classify_luid(luid: &str, vendor_map: &std::collections::HashMap<String, String>) -> GpuClass {
+    // Primary: vendor keyword matching (works on any machine)
+    if let Some(vendor) = vendor_map.get(luid) {
+        let v = vendor.to_lowercase();
+        if v.contains("intel") {
+            return GpuClass::IGpu;
+        }
+        if v.contains("nvidia") || v.contains("amd") || v.contains("radeon") {
+            return GpuClass::DGpu;
+        }
+    }
+
+    // Fallback: hardcoded LUIDs from the developer's machine (3-GPU system).
+    // NOTE: These are machine-specific. On a different machine, unrecognised
+    // LUIDs will fall through to GpuClass::Unknown and be logged.
+    match luid {
+        "0x00017A19" => GpuClass::IGpu,  // Intel iGPU (GDI Render, VideoProcessing engines)
+        "0x00017C9F" => GpuClass::IGpu,  // Intel Xe display adapter (21× engtype_3D)
+        "0x00017D0F" => GpuClass::DGpu,  // Nvidia dGPU (Cuda, VR, OFA_0, Compute engines)
+        _ => GpuClass::Unknown,
     }
 }
 
