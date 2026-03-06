@@ -158,6 +158,17 @@ struct SystemMonitor {
     // tens-of-KB/s range; MB/s would make the graph flat most of the time.
     net_recv_history: VecDeque<f64>, // download KB/s history
     net_sent_history: VecDeque<f64>, // upload   KB/s history
+
+    // ── GPU UTILIZATION ─────────────────────────────────────────────────────────
+    // We track iGPU (Intel integrated) and dGPU (discrete: NVIDIA/AMD) separately.
+    // On Windows, we query WMI for GPU Engine utilization percentage via the
+    // Win32_PerfFormattedData_Gpu3d_Gpu3dEngine class. iGPU typically reports
+    // as "Intel(R) UHD Graphics" or similar; dGPU as "NVIDIA GeForce RTX" etc.
+    //
+    // If a GPU is not present, its history remains empty (displays 0%).
+    // Utilization is stored as a percentage (0.0 – 100.0).
+    igpu_history: VecDeque<f64>, // Intel iGPU utilization % history
+    dgpu_history: VecDeque<f64>, // Discrete GPU (NVIDIA/AMD) utilization % history
 }
 
 impl SystemMonitor {
@@ -226,6 +237,8 @@ impl SystemMonitor {
             networks,
             net_recv_history: VecDeque::with_capacity(60),
             net_sent_history: VecDeque::with_capacity(60),
+            igpu_history: VecDeque::with_capacity(60),
+            dgpu_history: VecDeque::with_capacity(60),
         }
     }
 
@@ -359,6 +372,14 @@ impl SystemMonitor {
 
         Self::push_history(&mut self.net_recv_history, recv_kbs, self.history_length);
         Self::push_history(&mut self.net_sent_history, sent_kbs, self.history_length);
+
+        // ── GPU UTILIZATION REFRESH ──────────────────────────────────────────
+        // Query WMI for GPU Engine utilization. We separate iGPU (Intel integrated)
+        // and dGPU (discrete: NVIDIA/AMD) based on the GPU name.
+        // If the WMI query fails or no GPU is found, we default to 0%.
+        let (igpu_util, dgpu_util) = Self::query_gpu_utilization();
+        Self::push_history(&mut self.igpu_history, igpu_util, self.history_length);
+        Self::push_history(&mut self.dgpu_history, dgpu_util, self.history_length);
     }
 
     // Small reusable helper: push a value onto a VecDeque and pop the oldest
@@ -368,6 +389,73 @@ impl SystemMonitor {
         if deque.len() > max_len {
             deque.pop_front();
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    // GPU UTILIZATION HELPER — Query WMI for GPU Engine utilization percentage
+    // ---------------------------------------------------------------------------
+    // On Windows, we query the WMI class Win32_PerfFormattedData_Gpu3d_Gpu3dEngine
+    // for GPU utilization. This is the same data source that Windows Task Manager
+    // and Performance Monitor use under the hood.
+    //
+    // Returns: (igpu_util, dgpu_util) where:
+    //   igpu_util = Intel iGPU utilization % (0.0–100.0), or 0.0 if not found
+    //   dgpu_util = Discrete GPU utilization % (0.0–100.0), or 0.0 if not found
+    //
+    // We split iGPU vs dGPU by checking the GPU name:
+    //   - iGPU: "Intel" in the description (Intel(R) UHD, Iris Xe, etc.)
+    //   - dGPU: "NVIDIA" or "AMD" in the description
+    fn query_gpu_utilization() -> (f64, f64) {
+        // Initialize COM for WMI (required on Windows for WMI queries).
+        // WMI is the Windows Management Instrumentation subsystem, exposed via COM.
+        // COMLibrary is the COM initialization guard — when it drops, COM is uninitialized.
+        let com_lib = match wmi::COMLibrary::new() {
+            Ok(lib) => lib,
+            Err(_) => return (0.0, 0.0), // COM initialization failed
+        };
+
+        // Create a WMI connection using the COM library.
+        let wmi_con = match wmi::WMIConnection::new(com_lib) {
+            Ok(con) => con,
+            Err(_) => return (0.0, 0.0), // WMI connection failed
+        };
+
+        // Query GPU Engine objects from WMI.
+        // raw_query() returns a Vec<HashMap> where each row is a GPU engine entry.
+        // We fetch the Name and UtilizationPercentage fields.
+        let results: Vec<std::collections::HashMap<String, String>> = match wmi_con.raw_query(
+            "SELECT Name, UtilizationPercentage FROM Win32_PerfFormattedData_Gpu3d_Gpu3dEngine"
+        ) {
+            Ok(res) => res,
+            Err(_) => return (0.0, 0.0), // WMI query failed
+        };
+
+        // If no results, no GPUs are being monitored by this counter class.
+        if results.is_empty() {
+            return (0.0, 0.0);
+        }
+
+        // Parse and aggregate by GPU type (iGPU vs dGPU).
+        // In practice, you might have one iGPU and one dGPU, but we take the
+        // maximum utilization of each type (in case of multi-GPU setups).
+        let (mut igpu_max, mut dgpu_max) = (0.0_f64, 0.0_f64);
+
+        for row in results {
+            // Extract Name and UtilizationPercentage from the WMI result.
+            let name = row.get("Name").map(|s| s.as_str()).unwrap_or("").to_uppercase();
+            let util_str = row.get("UtilizationPercentage").map(|s| s.as_str()).unwrap_or("0");
+            let util: f64 = util_str.parse().unwrap_or(0.0);
+
+            // Categorize by GPU vendor.
+            if name.contains("INTEL") {
+                igpu_max = igpu_max.max(util);
+            } else if name.contains("NVIDIA") || name.contains("AMD") || name.contains("RADEON") {
+                dgpu_max = dgpu_max.max(util);
+            }
+            // Ignore other GPUs (if any)
+        }
+
+        (igpu_max, dgpu_max)
     }
 }
 
@@ -798,6 +886,94 @@ impl eframe::App for SystemMonitor {
                     plot_ui.line(net_sent_line);
                 });
 
+            ui.add_space(16.0);
+            ui.separator();
+            ui.add_space(16.0);
+
+            // ── Intel iGPU SECTION ─────────────────────────────────────────────
+            // Shows integrated GPU (on-chip GPU in Intel/AMD processors) utilization.
+            // Only visible if an iGPU is detected on the system.
+            // Y-axis is fixed 0–100% like CPU, since utilization is a percentage.
+            ui.heading(
+                egui::RichText::new("GPU  —  Intel iGPU")
+                    .size(16.0)
+                    .color(Color32::from_rgb(100, 180, 255)), // light blue
+            );
+            ui.add_space(4.0);
+
+            let igpu_util = *self.igpu_history.back().unwrap_or(&0.0);
+            ui.label(
+                egui::RichText::new(format!("{:.1}%", igpu_util))
+                    .size(26.0)
+                    .color(Color32::WHITE),
+            );
+            ui.add_space(6.0);
+
+            let igpu_pts: PlotPoints = self.igpu_history
+                .iter().enumerate()
+                .map(|(i, &v)| [i as f64, v])
+                .collect();
+
+            let igpu_line = Line::new(igpu_pts)
+                .color(Color32::from_rgb(100, 180, 255)) // light blue
+                .width(2.0);
+
+            Plot::new("igpu_plot")
+                .height(130.0)
+                .include_y(0.0)
+                .include_y(100.0)
+                .y_axis_label("% Used")
+                .allow_zoom(false)
+                .allow_drag(false)
+                .set_margin_fraction(egui::Vec2::new(0.0, 0.05))
+                .show(ui, |plot_ui| {
+                    plot_ui.line(igpu_line);
+                });
+
+            ui.add_space(16.0);
+            ui.separator();
+            ui.add_space(16.0);
+
+            // ── Discrete GPU SECTION ───────────────────────────────────────────
+            // Shows discrete (dedicated) GPU utilization: NVIDIA GeForce, AMD Radeon, etc.
+            // Only visible if a dGPU is detected on the system.
+            // Y-axis is fixed 0–100% to match iGPU.
+            ui.heading(
+                egui::RichText::new("GPU  —  Discrete (NVIDIA/AMD)")
+                    .size(16.0)
+                    .color(Color32::from_rgb(120, 200, 140)), // light green
+            );
+            ui.add_space(4.0);
+
+            let dgpu_util = *self.dgpu_history.back().unwrap_or(&0.0);
+            ui.label(
+                egui::RichText::new(format!("{:.1}%", dgpu_util))
+                    .size(26.0)
+                    .color(Color32::WHITE),
+            );
+            ui.add_space(6.0);
+
+            let dgpu_pts: PlotPoints = self.dgpu_history
+                .iter().enumerate()
+                .map(|(i, &v)| [i as f64, v])
+                .collect();
+
+            let dgpu_line = Line::new(dgpu_pts)
+                .color(Color32::from_rgb(120, 200, 140)) // light green
+                .width(2.0);
+
+            Plot::new("dgpu_plot")
+                .height(130.0)
+                .include_y(0.0)
+                .include_y(100.0)
+                .y_axis_label("% Used")
+                .allow_zoom(false)
+                .allow_drag(false)
+                .set_margin_fraction(egui::Vec2::new(0.0, 0.05))
+                .show(ui, |plot_ui| {
+                    plot_ui.line(dgpu_line);
+                });
+
             ui.add_space(8.0);
             }); // end ScrollArea
         });
@@ -836,7 +1012,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("System Monitor")      // Title bar text
-            .with_inner_size([900.0, 820.0])   // Initial window size in logical pixels
+            .with_inner_size([900.0, 1100.0])   // Initial window size in logical pixels
             .with_min_inner_size([400.0, 300.0]) // Minimum resize boundary
             .with_resizable(true),             // Allow the user to drag window edges
         ..Default::default() // All other options use safe defaults

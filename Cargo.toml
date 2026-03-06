@@ -8,6 +8,7 @@ eframe = "0.27"
 egui = "0.27"
 egui_plot = "0.27"
 sysinfo = "0.33"
+wmi = "0.13"  # Windows WMI queries for GPU monitoring
 
 # Tells Windows not to open a console (black terminal) window behind the GUI.
 # Without this, you'd see a cmd.exe window pop up every time you launch the .exe.
