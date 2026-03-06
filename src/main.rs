@@ -114,8 +114,21 @@ struct SystemMonitor {
     // We use this to throttle our system polling to once per second.
     last_update: Instant,
 
-    // Maximum number of data points to keep. 60 = last 60 seconds at 1 Hz.
+    // Number of data points to display in the current time window.
+    // Dynamically set by the time range selector (30, 60, 300, 600, 1800, 3600).
     history_length: usize,
+
+    // The maximum capacity of the history buffer — always 3600 (one data point
+    // per second for 1 full hour). The buffer must be this large regardless of
+    // the user's currently selected time range, because the user might switch
+    // from "30s" to "1h" at any time and expects to see all data that was
+    // silently collected in the background. If the buffer were capped at the
+    // display window size, switching to a longer range would show gaps.
+    max_history: usize,
+
+    // The currently selected duration in seconds, controlled by the header
+    // buttons (30, 60, 300, 600, 1800, 3600). Default: 60 (1 minute).
+    selected_duration: u64,
 
     // ── DISK I/O ────────────────────────────────────────────────────────────
     // sysinfo::Disks is a dedicated handle for querying disk statistics.
@@ -218,27 +231,33 @@ impl SystemMonitor {
 
         SystemMonitor {
             system,
-            cpu_history: VecDeque::with_capacity(60), // pre-allocate for 60 items
-            mem_history: VecDeque::with_capacity(60),
+            // Pre-allocate VecDeques for the FULL 1-hour buffer (3600 data points).
+            // Even though we default to showing only 60 seconds, we always store
+            // up to 3600 points so the user can switch to a longer range at any
+            // time without losing data that was collected in the background.
+            cpu_history: VecDeque::with_capacity(3600),
+            mem_history: VecDeque::with_capacity(3600),
             // Instant::now() captures "right now". We subtract a full second so
             // the very first frame immediately triggers a data refresh instead of
             // waiting one second for the first reading.
             last_update: Instant::now() - Duration::from_secs(1),
-            history_length: 60,
+            history_length: 60,       // default display window: 1 minute
+            max_history: 3600,        // buffer cap: 1 hour (3600 seconds)
+            selected_duration: 60,    // default selected time range: 1 minute
             disks,
-            disk_c_read_history:  VecDeque::with_capacity(60),
-            disk_c_write_history: VecDeque::with_capacity(60),
-            disk_d_read_history:  VecDeque::with_capacity(60),
-            disk_d_write_history: VecDeque::with_capacity(60),
+            disk_c_read_history:  VecDeque::with_capacity(3600),
+            disk_c_write_history: VecDeque::with_capacity(3600),
+            disk_d_read_history:  VecDeque::with_capacity(3600),
+            disk_d_write_history: VecDeque::with_capacity(3600),
             disk_c_prev_read:  c_r0,
             disk_c_prev_write: c_w0,
             disk_d_prev_read:  d_r0,
             disk_d_prev_write: d_w0,
             networks,
-            net_recv_history: VecDeque::with_capacity(60),
-            net_sent_history: VecDeque::with_capacity(60),
-            igpu_history: VecDeque::with_capacity(60),
-            dgpu_history: VecDeque::with_capacity(60),
+            net_recv_history: VecDeque::with_capacity(3600),
+            net_sent_history: VecDeque::with_capacity(3600),
+            igpu_history: VecDeque::with_capacity(3600),
+            dgpu_history: VecDeque::with_capacity(3600),
         }
     }
 
@@ -299,12 +318,13 @@ impl SystemMonitor {
         self.cpu_history.push_back(cpu_pct);
         self.mem_history.push_back(mem_pct);
 
-        // If we've exceeded the window size, pop the FRONT (oldest value).
-        // This is the core ring-buffer pattern: push_back + pop_front = sliding window.
-        if self.cpu_history.len() > self.history_length {
+        // Pop from the front when the buffer exceeds max_history (3600), NOT
+        // history_length. We always retain the full hour of data so the user
+        // can freely switch between time ranges without losing history.
+        if self.cpu_history.len() > self.max_history {
             self.cpu_history.pop_front();
         }
-        if self.mem_history.len() > self.history_length {
+        if self.mem_history.len() > self.max_history {
             self.mem_history.pop_front();
         }
 
@@ -332,11 +352,11 @@ impl SystemMonitor {
         self.disk_d_prev_read  = d_r;
         self.disk_d_prev_write = d_w;
 
-        // Push rates into the sliding-window histories.
-        Self::push_history(&mut self.disk_c_read_history,  c_read_mbs,  self.history_length);
-        Self::push_history(&mut self.disk_c_write_history, c_write_mbs, self.history_length);
-        Self::push_history(&mut self.disk_d_read_history,  d_read_mbs,  self.history_length);
-        Self::push_history(&mut self.disk_d_write_history, d_write_mbs, self.history_length);
+        // Push rates into the sliding-window histories (capped at max_history, not history_length).
+        Self::push_history(&mut self.disk_c_read_history,  c_read_mbs,  self.max_history);
+        Self::push_history(&mut self.disk_c_write_history, c_write_mbs, self.max_history);
+        Self::push_history(&mut self.disk_d_read_history,  d_read_mbs,  self.max_history);
+        Self::push_history(&mut self.disk_d_write_history, d_write_mbs, self.max_history);
 
         // ── NETWORK I/O REFRESH ─────────────────────────────────────────────
         // networks.refresh(false) calls GetIfEntry2() for each interface.
@@ -370,16 +390,16 @@ impl SystemMonitor {
         let recv_kbs = total_recv_bytes as f64 / 1024.0;
         let sent_kbs = total_sent_bytes as f64 / 1024.0;
 
-        Self::push_history(&mut self.net_recv_history, recv_kbs, self.history_length);
-        Self::push_history(&mut self.net_sent_history, sent_kbs, self.history_length);
+        Self::push_history(&mut self.net_recv_history, recv_kbs, self.max_history);
+        Self::push_history(&mut self.net_sent_history, sent_kbs, self.max_history);
 
         // ── GPU UTILIZATION REFRESH ──────────────────────────────────────────
         // Query WMI for GPU Engine utilization. We separate iGPU (Intel integrated)
         // and dGPU (discrete: NVIDIA/AMD) based on the GPU name.
         // If the WMI query fails or no GPU is found, we default to 0%.
         let (igpu_util, dgpu_util) = Self::query_gpu_utilization();
-        Self::push_history(&mut self.igpu_history, igpu_util, self.history_length);
-        Self::push_history(&mut self.dgpu_history, dgpu_util, self.history_length);
+        Self::push_history(&mut self.igpu_history, igpu_util, self.max_history);
+        Self::push_history(&mut self.dgpu_history, dgpu_util, self.max_history);
     }
 
     // Small reusable helper: push a value onto a VecDeque and pop the oldest
@@ -613,411 +633,439 @@ impl eframe::App for SystemMonitor {
             // Add some breathing room around all content, like CSS padding.
             ui.add_space(8.0);
 
-            // ── CPU SECTION ──────────────────────────────────────────────────────
-            // RichText lets us style the text — font size, color, bold, etc.
-            ui.heading(
-                egui::RichText::new("CPU Usage")
-                    .size(16.0)
-                    .color(Color32::from_rgb(100, 180, 255)), // light blue
-            );
-            ui.add_space(4.0);
-
-            // Current value as a text label.
-            // format!() is Rust's equivalent of template literals: `CPU: ${value.toFixed(1)}%`
-            ui.label(
-                egui::RichText::new(format!("{:.1}%", current_cpu))
-                    .size(26.0)
-                    .color(Color32::WHITE),
-            );
-            ui.add_space(6.0);
-
-            // Build the CPU line graph data.
-            // egui_plot expects PlotPoints, which is a list of [x, y] pairs.
-            // We enumerate the deque to get (index, value) and map that to [x, y].
-            // X = seconds ago from 0 (oldest) to 59 (newest on the right).
-            // Web analogy: this is like building a data array for Chart.js:
-            //   const data = cpuHistory.map((y, x) => ({ x, y }));
-            let cpu_points: PlotPoints = self
-                .cpu_history
-                .iter()
-                .enumerate()
-                .map(|(i, &val)| [i as f64, val])
-                .collect();
-
-            let cpu_line = Line::new(cpu_points)
-                .color(Color32::from_rgb(70, 140, 255)) // blue line
-                .width(2.0);
-
-            // Plot widget — this is the chart container.
-            // .height() sets the pixel height of the chart area.
-            // .include_y() pins the Y axis to always show 0–100.
-            // .show_axes() shows the X and Y axis lines.
-            // .allow_zoom(false) / .allow_drag(false) = non-interactive (read-only display).
-            Plot::new("cpu_plot")
-                .height(140.0)
-                .include_y(0.0)
-                .include_y(100.0)
-                .y_axis_label("% Usage")
-                .allow_zoom(false)
-                .allow_drag(false)
-                .set_margin_fraction(egui::Vec2::new(0.0, 0.05))
-                .show(ui, |plot_ui| {
-                    plot_ui.line(cpu_line);
-                });
-
-            ui.add_space(16.0);
-            // Draw a horizontal rule to visually separate CPU and Memory sections.
-            // Like <hr> in HTML.
-            ui.separator();
-            ui.add_space(16.0);
-
-            // ── MEMORY SECTION ────────────────────────────────────────────────────
-            ui.heading(
-                egui::RichText::new("Memory Usage")
-                    .size(16.0)
-                    .color(Color32::from_rgb(100, 220, 130)), // light green
-            );
-            ui.add_space(4.0);
-
-            // Show both the percentage and the absolute GB figure (like Task Manager).
-            ui.label(
-                egui::RichText::new(format!(
-                    "{:.1}%  ({:.1} GB / {:.1} GB)",
-                    current_mem_pct, used_gb, total_gb
-                ))
-                .size(26.0)
-                .color(Color32::WHITE),
-            );
-            ui.add_space(6.0);
-
-            let mem_points: PlotPoints = self
-                .mem_history
-                .iter()
-                .enumerate()
-                .map(|(i, &val)| [i as f64, val])
-                .collect();
-
-            let mem_line = Line::new(mem_points)
-                .color(Color32::from_rgb(80, 210, 110)) // green line
-                .width(2.0);
-
-            Plot::new("mem_plot")
-                .height(140.0)
-                .include_y(0.0)
-                .include_y(100.0)
-                .y_axis_label("% Used")
-                .allow_zoom(false)
-                .allow_drag(false)
-                .set_margin_fraction(egui::Vec2::new(0.0, 0.05))
-                .show(ui, |plot_ui| {
-                    plot_ui.line(mem_line);
-                });
-
-            ui.add_space(16.0);
-            ui.separator();
-            ui.add_space(16.0);
-
-            // ── DISK C: SECTION ───────────────────────────────────────────────
-            // Each disk section shows two lines on one graph:
-            //   orange = read rate   (data coming FROM the disk INTO RAM)
-            //   red    = write rate  (data going FROM RAM TO the disk)
-            // This matches the Task Manager disk view which overlays both on one chart.
+            // ── TIME RANGE SELECTOR ──────────────────────────────────────────
+            // Display a row of selectable buttons that control how many seconds
+            // of history all graphs display. Only one can be active at a time
+            // (radio-button behaviour).
             //
-            // The Y-axis auto-scales to the data (no fixed 0–100 cap) because disk
-            // speeds vary wildly: an NVMe SSD can burst to 3000+ MB/s while an
-            // HDD tops out at ~150 MB/s. include_y(0.0) anchors the bottom;
-            // include_y(1.0) ensures the chart never collapses to a flat line at idle.
-            ui.heading(
-                egui::RichText::new("Disk C:  —  I/O Rate")
-                    .size(16.0)
-                    .color(Color32::from_rgb(255, 180, 80)), // orange
-            );
-            ui.add_space(4.0);
-
-            let c_read_now  = *self.disk_c_read_history.back().unwrap_or(&0.0);
-            let c_write_now = *self.disk_c_write_history.back().unwrap_or(&0.0);
-
-            // Two separate colored labels so it's immediately clear which is which.
+            // egui's selectable_value() works like a radio button group:
+            //   ui.selectable_value(&mut state_var, candidate_value, label)
+            //   • If state_var == candidate_value → renders with a filled/highlighted
+            //     background (the "selected" look).
+            //   • If state_var != candidate_value → renders with a subtle outline
+            //     (the "unselected" look).
+            //   • On click → sets state_var = candidate_value automatically.
+            // Because all buttons share the same &mut variable (selected_duration),
+            // selecting one deselects the others — exactly like HTML radio inputs.
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new(format!("Read:  {:.2} MB/s", c_read_now))
-                        .size(18.0)
-                        .color(Color32::from_rgb(255, 180, 80)), // orange
+                    egui::RichText::new("Time Range:")
+                        .size(14.0)
+                        .color(Color32::from_rgb(180, 180, 180)),
                 );
-                ui.add_space(24.0);
-                ui.label(
-                    egui::RichText::new(format!("Write: {:.2} MB/s", c_write_now))
-                        .size(18.0)
-                        .color(Color32::from_rgb(220, 80, 80)), // red
-                );
-            });
-            ui.add_space(6.0);
-
-            // Build PlotPoints for both lines from the same iteration index.
-            let c_read_pts: PlotPoints = self.disk_c_read_history
-                .iter().enumerate()
-                .map(|(i, &v)| [i as f64, v])
-                .collect();
-            let c_write_pts: PlotPoints = self.disk_c_write_history
-                .iter().enumerate()
-                .map(|(i, &v)| [i as f64, v])
-                .collect();
-
-            let c_read_line  = Line::new(c_read_pts)
-                .color(Color32::from_rgb(255, 180, 80)) // orange
-                .width(2.0)
-                .name("Read");
-            let c_write_line = Line::new(c_write_pts)
-                .color(Color32::from_rgb(220, 80, 80))  // red
-                .width(2.0)
-                .name("Write");
-
-            Plot::new("disk_c_plot")
-                .height(130.0)
-                .include_y(0.0)
-                .include_y(1.0)  // minimum range so idle drives don't show a flat graph
-                .y_axis_label("MB/s")
-                .allow_zoom(false)
-                .allow_drag(false)
-                .set_margin_fraction(egui::Vec2::new(0.0, 0.05))
-                .show(ui, |plot_ui| {
-                    plot_ui.line(c_read_line);
-                    plot_ui.line(c_write_line);
-                });
-
-            ui.add_space(16.0);
-            ui.separator();
-            ui.add_space(16.0);
-
-            // ── DISK D: SECTION ───────────────────────────────────────────────
-            ui.heading(
-                egui::RichText::new("Disk D:  —  I/O Rate")
-                    .size(16.0)
-                    .color(Color32::from_rgb(255, 220, 80)), // yellow-orange
-            );
-            ui.add_space(4.0);
-
-            let d_read_now  = *self.disk_d_read_history.back().unwrap_or(&0.0);
-            let d_write_now = *self.disk_d_write_history.back().unwrap_or(&0.0);
-
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(format!("Read:  {:.2} MB/s", d_read_now))
-                        .size(18.0)
-                        .color(Color32::from_rgb(255, 220, 80)), // yellow-orange
-                );
-                ui.add_space(24.0);
-                ui.label(
-                    egui::RichText::new(format!("Write: {:.2} MB/s", d_write_now))
-                        .size(18.0)
-                        .color(Color32::from_rgb(180, 100, 220)), // purple
-                );
-            });
-            ui.add_space(6.0);
-
-            let d_read_pts: PlotPoints = self.disk_d_read_history
-                .iter().enumerate()
-                .map(|(i, &v)| [i as f64, v])
-                .collect();
-            let d_write_pts: PlotPoints = self.disk_d_write_history
-                .iter().enumerate()
-                .map(|(i, &v)| [i as f64, v])
-                .collect();
-
-            let d_read_line  = Line::new(d_read_pts)
-                .color(Color32::from_rgb(255, 220, 80))  // yellow-orange
-                .width(2.0)
-                .name("Read");
-            let d_write_line = Line::new(d_write_pts)
-                .color(Color32::from_rgb(180, 100, 220)) // purple
-                .width(2.0)
-                .name("Write");
-
-            Plot::new("disk_d_plot")
-                .height(130.0)
-                .include_y(0.0)
-                .include_y(1.0)
-                .y_axis_label("MB/s")
-                .allow_zoom(false)
-                .allow_drag(false)
-                .set_margin_fraction(egui::Vec2::new(0.0, 0.05))
-                .show(ui, |plot_ui| {
-                    plot_ui.line(d_read_line);
-                    plot_ui.line(d_write_line);
-                });
-
-            ui.add_space(16.0);
-            ui.separator();
-            ui.add_space(16.0);
-
-            // ── NETWORK SECTION ───────────────────────────────────────────────
-            // Shows combined download + upload rates across ALL non-loopback
-            // network adapters (Ethernet + Wi-Fi + VPN, etc. summed together).
-            //
-            // Two lines on one graph:
-            //   cyan  = download (received, data coming IN from the internet)
-            //   pink  = upload   (transmitted, data going OUT to the internet)
-            //
-            // Y-axis is auto-scaling in KB/s so it adapts from idle (near 0)
-            // to heavy load (10 000+ KB/s for a 100 Mbps stream).
-            // include_y(10.0) sets a reasonable minimum scale so the graph never
-            // collapses to a completely flat line during idle periods.
-            ui.heading(
-                egui::RichText::new("Network  —  Total (all adapters)")
-                    .size(16.0)
-                    .color(Color32::from_rgb(80, 220, 240)), // cyan
-            );
-            ui.add_space(4.0);
-
-            let net_recv_now = *self.net_recv_history.back().unwrap_or(&0.0);
-            let net_sent_now = *self.net_sent_history.back().unwrap_or(&0.0);
-
-            // Format helper: display as KB/s below 1 MB/s threshold, MB/s above.
-            // This mirrors how Task Manager switches units dynamically.
-            let fmt_net = |kbs: f64| -> String {
-                if kbs >= 1024.0 {
-                    format!("{:.2} MB/s", kbs / 1024.0)
-                } else {
-                    format!("{:.1} KB/s", kbs)
+                for &(label, duration) in &[
+                    ("30s", 30u64), ("1m", 60), ("5m", 300),
+                    ("10m", 600), ("30m", 1800), ("1h", 3600),
+                ] {
+                    ui.selectable_value(&mut self.selected_duration, duration, label);
                 }
+            });
+
+            // Sync the display window size with the (possibly just-changed)
+            // selected duration. This runs every frame so graphs immediately
+            // reflect any change from the buttons above.
+            self.history_length = self.selected_duration as usize;
+
+            // Human-readable X axis label reflecting the selected time range.
+            let x_label = match self.selected_duration {
+                30   => "Last 30 seconds",
+                60   => "Last 1 minute",
+                300  => "Last 5 minutes",
+                600  => "Last 10 minutes",
+                1800 => "Last 30 minutes",
+                3600 => "Last 1 hour",
+                _    => "Time",
             };
 
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(format!("\u{25bc} Download: {}", fmt_net(net_recv_now)))
-                        .size(18.0)
-                        .color(Color32::from_rgb(80, 220, 240)), // cyan
+            ui.add_space(8.0);
+
+            // ── CPU CARD ─────────────────────────────────────────────────────
+            // egui::Frame is a container widget — similar to a <div> with CSS
+            // border and padding in web development. It draws a bordered, padded
+            // box around its child widgets, visually grouping them into a "card".
+            //
+            // Frame::group(ui.style()) uses the theme's "group" style which
+            // provides a subtle rounded border and internal padding. Compare to
+            // Frame::none() (invisible) or Frame::canvas() (opaque fill) — group()
+            // strikes the best balance for card-style layouts.
+            //
+            // NOTE: This card structure is the foundation for drag-and-drop and
+            // flexbox-like reordering of metric panels planned for a future increment.
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.heading(
+                    egui::RichText::new(format!("CPU Usage  —  {:.1}%", current_cpu))
+                        .size(16.0)
+                        .color(Color32::from_rgb(100, 180, 255)),
                 );
-                ui.add_space(24.0);
-                ui.label(
-                    egui::RichText::new(format!("\u{25b2} Upload:   {}", fmt_net(net_sent_now)))
-                        .size(18.0)
-                        .color(Color32::from_rgb(240, 130, 200)), // pink
-                );
+                ui.add_space(6.0);
+
+                // To display only the selected time window from the full 3600-point
+                // buffer, we take the last `history_length` elements from the VecDeque.
+                // VecDeque::iter() yields items front-to-back (oldest → newest).
+                // By computing skip = total_items − window_size and calling .skip(skip),
+                // we start iterating from the (total − window)th element — i.e. we get
+                // only the most recent `window` data points. After skip, enumerate()
+                // produces 0-based X coordinates: x=0 is the oldest visible point,
+                // x=window−1 is the newest.
+                let window = self.history_length.min(self.cpu_history.len());
+                let skip = self.cpu_history.len() - window;
+                let cpu_points: PlotPoints = self
+                    .cpu_history
+                    .iter()
+                    .skip(skip)
+                    .enumerate()
+                    .map(|(i, &val)| [i as f64, val])
+                    .collect();
+
+                let cpu_line = Line::new(cpu_points)
+                    .color(Color32::from_rgb(70, 140, 255))
+                    .width(2.0);
+
+                // egui_plot auto-scales axes by default to fit the visible data.
+                // This means if all values hover around 30%, the Y axis might zoom
+                // in to 25–35%, hiding the full 0–100 context. include_y(0.0) and
+                // include_y(100.0) force the Y axis to always span the full range.
+                // Performance metrics (CPU, memory) are physical quantities that
+                // can never go below 0% or above 100%, so locking the range is correct.
+                // allow_scroll(false) prevents mouse-wheel scrolling which could
+                // shift the view into negative territory, defeating the include_y pins.
+                Plot::new("cpu_plot")
+                    .height(140.0)
+                    .include_y(0.0)
+                    .include_y(100.0)
+                    .y_axis_label("% Usage")
+                    .x_axis_label(x_label)
+                    .allow_zoom(false)
+                    .allow_drag(false)
+                    .allow_scroll(false)
+                    .set_margin_fraction(egui::Vec2::new(0.0, 0.05))
+                    .show(ui, |plot_ui| {
+                        plot_ui.line(cpu_line);
+                    });
             });
-            ui.add_space(6.0);
+            ui.add_space(8.0);
 
-            let net_recv_pts: PlotPoints = self.net_recv_history
-                .iter().enumerate()
-                .map(|(i, &v)| [i as f64, v])
-                .collect();
-            let net_sent_pts: PlotPoints = self.net_sent_history
-                .iter().enumerate()
-                .map(|(i, &v)| [i as f64, v])
-                .collect();
+            // ── MEMORY CARD ────────────────────────────────────────────────────
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.heading(
+                    egui::RichText::new(format!(
+                        "Memory Usage  —  {:.1}%  ({:.1} GB / {:.1} GB)",
+                        current_mem_pct, used_gb, total_gb
+                    ))
+                        .size(16.0)
+                        .color(Color32::from_rgb(100, 220, 130)),
+                );
+                ui.add_space(6.0);
 
-            let net_recv_line = Line::new(net_recv_pts)
-                .color(Color32::from_rgb(80, 220, 240))  // cyan
-                .width(2.0)
-                .name("Download");
-            let net_sent_line = Line::new(net_sent_pts)
-                .color(Color32::from_rgb(240, 130, 200)) // pink
-                .width(2.0)
-                .name("Upload");
+                // Slice the last `history_length` points from the buffer for display.
+                let window = self.history_length.min(self.mem_history.len());
+                let skip = self.mem_history.len() - window;
+                let mem_points: PlotPoints = self
+                    .mem_history
+                    .iter()
+                    .skip(skip)
+                    .enumerate()
+                    .map(|(i, &val)| [i as f64, val])
+                    .collect();
 
-            // Y-axis label adapts to units: since we plot raw KB/s values,
-            // we always label it KB/s for consistency with the data range.
-            Plot::new("net_plot")
-                .height(130.0)
-                .include_y(0.0)
-                .include_y(10.0)  // show at least 0–10 KB/s so the graph is never flat
-                .y_axis_label("KB/s")
-                .allow_zoom(false)
-                .allow_drag(false)
-                .set_margin_fraction(egui::Vec2::new(0.0, 0.05))
-                .show(ui, |plot_ui| {
-                    plot_ui.line(net_recv_line);
-                    plot_ui.line(net_sent_line);
+                let mem_line = Line::new(mem_points)
+                    .color(Color32::from_rgb(80, 210, 110))
+                    .width(2.0);
+
+                // Y axis locked 0–100: memory percentage can never be negative.
+                // allow_scroll(false) prevents scrolling into negative territory.
+                Plot::new("mem_plot")
+                    .height(140.0)
+                    .include_y(0.0)
+                    .include_y(100.0)
+                    .y_axis_label("% Used")
+                    .x_axis_label(x_label)
+                    .allow_zoom(false)
+                    .allow_drag(false)
+                    .allow_scroll(false)
+                    .set_margin_fraction(egui::Vec2::new(0.0, 0.05))
+                    .show(ui, |plot_ui| {
+                        plot_ui.line(mem_line);
+                    });
+            });
+            ui.add_space(8.0);
+
+            // ── DISK C: CARD ───────────────────────────────────────────────
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.heading(
+                    egui::RichText::new("Disk C:  —  I/O Rate")
+                        .size(16.0)
+                        .color(Color32::from_rgb(255, 180, 80)),
+                );
+                ui.add_space(4.0);
+
+                let c_read_now  = *self.disk_c_read_history.back().unwrap_or(&0.0);
+                let c_write_now = *self.disk_c_write_history.back().unwrap_or(&0.0);
+
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("Read:  {:.2} MB/s", c_read_now))
+                            .size(18.0)
+                            .color(Color32::from_rgb(255, 180, 80)),
+                    );
+                    ui.add_space(24.0);
+                    ui.label(
+                        egui::RichText::new(format!("Write: {:.2} MB/s", c_write_now))
+                            .size(18.0)
+                            .color(Color32::from_rgb(220, 80, 80)),
+                    );
                 });
+                ui.add_space(6.0);
 
-            ui.add_space(16.0);
-            ui.separator();
-            ui.add_space(16.0);
+                // Slice the last `history_length` points for display.
+                let window = self.history_length.min(self.disk_c_read_history.len());
+                let skip_r = self.disk_c_read_history.len() - window;
+                let c_read_pts: PlotPoints = self.disk_c_read_history
+                    .iter().skip(skip_r).enumerate()
+                    .map(|(i, &v)| [i as f64, v])
+                    .collect();
+                let skip_w = self.disk_c_write_history.len().saturating_sub(window);
+                let c_write_pts: PlotPoints = self.disk_c_write_history
+                    .iter().skip(skip_w).enumerate()
+                    .map(|(i, &v)| [i as f64, v])
+                    .collect();
 
-            // ── Intel iGPU SECTION ─────────────────────────────────────────────
-            // Shows integrated GPU (on-chip GPU in Intel/AMD processors) utilization.
-            // Only visible if an iGPU is detected on the system.
-            // Y-axis is fixed 0–100% like CPU, since utilization is a percentage.
-            ui.heading(
-                egui::RichText::new("GPU  —  Intel iGPU")
-                    .size(16.0)
-                    .color(Color32::from_rgb(100, 180, 255)), // light blue
-            );
-            ui.add_space(4.0);
+                let c_read_line  = Line::new(c_read_pts)
+                    .color(Color32::from_rgb(255, 180, 80))
+                    .width(2.0)
+                    .name("Read");
+                let c_write_line = Line::new(c_write_pts)
+                    .color(Color32::from_rgb(220, 80, 80))
+                    .width(2.0)
+                    .name("Write");
 
-            let igpu_util = *self.igpu_history.back().unwrap_or(&0.0);
-            ui.label(
-                egui::RichText::new(format!("{:.1}%", igpu_util))
-                    .size(26.0)
-                    .color(Color32::WHITE),
-            );
-            ui.add_space(6.0);
+                Plot::new("disk_c_plot")
+                    .height(140.0)
+                    .include_y(0.0)
+                    .include_y(1.0)
+                    .y_axis_label("MB/s")
+                    .x_axis_label(x_label)
+                    .allow_zoom(false)
+                    .allow_drag(false)
+                    .allow_scroll(false)
+                    .set_margin_fraction(egui::Vec2::new(0.0, 0.05))
+                    .show(ui, |plot_ui| {
+                        plot_ui.line(c_read_line);
+                        plot_ui.line(c_write_line);
+                    });
+            });
+            ui.add_space(8.0);
 
-            let igpu_pts: PlotPoints = self.igpu_history
-                .iter().enumerate()
-                .map(|(i, &v)| [i as f64, v])
-                .collect();
+            // ── DISK D: CARD ───────────────────────────────────────────────
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.heading(
+                    egui::RichText::new("Disk D:  —  I/O Rate")
+                        .size(16.0)
+                        .color(Color32::from_rgb(255, 220, 80)),
+                );
+                ui.add_space(4.0);
 
-            let igpu_line = Line::new(igpu_pts)
-                .color(Color32::from_rgb(100, 180, 255)) // light blue
-                .width(2.0);
+                let d_read_now  = *self.disk_d_read_history.back().unwrap_or(&0.0);
+                let d_write_now = *self.disk_d_write_history.back().unwrap_or(&0.0);
 
-            Plot::new("igpu_plot")
-                .height(130.0)
-                .include_y(0.0)
-                .include_y(100.0)
-                .y_axis_label("% Used")
-                .allow_zoom(false)
-                .allow_drag(false)
-                .set_margin_fraction(egui::Vec2::new(0.0, 0.05))
-                .show(ui, |plot_ui| {
-                    plot_ui.line(igpu_line);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("Read:  {:.2} MB/s", d_read_now))
+                            .size(18.0)
+                            .color(Color32::from_rgb(255, 220, 80)),
+                    );
+                    ui.add_space(24.0);
+                    ui.label(
+                        egui::RichText::new(format!("Write: {:.2} MB/s", d_write_now))
+                            .size(18.0)
+                            .color(Color32::from_rgb(180, 100, 220)),
+                    );
                 });
+                ui.add_space(6.0);
 
-            ui.add_space(16.0);
-            ui.separator();
-            ui.add_space(16.0);
+                let window = self.history_length.min(self.disk_d_read_history.len());
+                let skip_r = self.disk_d_read_history.len() - window;
+                let d_read_pts: PlotPoints = self.disk_d_read_history
+                    .iter().skip(skip_r).enumerate()
+                    .map(|(i, &v)| [i as f64, v])
+                    .collect();
+                let skip_w = self.disk_d_write_history.len().saturating_sub(window);
+                let d_write_pts: PlotPoints = self.disk_d_write_history
+                    .iter().skip(skip_w).enumerate()
+                    .map(|(i, &v)| [i as f64, v])
+                    .collect();
 
-            // ── Discrete GPU SECTION ───────────────────────────────────────────
-            // Shows discrete (dedicated) GPU utilization: NVIDIA GeForce, AMD Radeon, etc.
-            // Only visible if a dGPU is detected on the system.
-            // Y-axis is fixed 0–100% to match iGPU.
-            ui.heading(
-                egui::RichText::new("GPU  —  Discrete (NVIDIA/AMD)")
-                    .size(16.0)
-                    .color(Color32::from_rgb(120, 200, 140)), // light green
-            );
-            ui.add_space(4.0);
+                let d_read_line  = Line::new(d_read_pts)
+                    .color(Color32::from_rgb(255, 220, 80))
+                    .width(2.0)
+                    .name("Read");
+                let d_write_line = Line::new(d_write_pts)
+                    .color(Color32::from_rgb(180, 100, 220))
+                    .width(2.0)
+                    .name("Write");
 
-            let dgpu_util = *self.dgpu_history.back().unwrap_or(&0.0);
-            ui.label(
-                egui::RichText::new(format!("{:.1}%", dgpu_util))
-                    .size(26.0)
-                    .color(Color32::WHITE),
-            );
-            ui.add_space(6.0);
+                Plot::new("disk_d_plot")
+                    .height(140.0)
+                    .include_y(0.0)
+                    .include_y(1.0)
+                    .y_axis_label("MB/s")
+                    .x_axis_label(x_label)
+                    .allow_zoom(false)
+                    .allow_drag(false)
+                    .allow_scroll(false)
+                    .set_margin_fraction(egui::Vec2::new(0.0, 0.05))
+                    .show(ui, |plot_ui| {
+                        plot_ui.line(d_read_line);
+                        plot_ui.line(d_write_line);
+                    });
+            });
+            ui.add_space(8.0);
 
-            let dgpu_pts: PlotPoints = self.dgpu_history
-                .iter().enumerate()
-                .map(|(i, &v)| [i as f64, v])
-                .collect();
+            // ── NETWORK CARD ──────────────────────────────────────────────
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.heading(
+                    egui::RichText::new("Network  —  Total (all adapters)")
+                        .size(16.0)
+                        .color(Color32::from_rgb(80, 220, 240)),
+                );
+                ui.add_space(4.0);
 
-            let dgpu_line = Line::new(dgpu_pts)
-                .color(Color32::from_rgb(120, 200, 140)) // light green
-                .width(2.0);
+                let net_recv_now = *self.net_recv_history.back().unwrap_or(&0.0);
+                let net_sent_now = *self.net_sent_history.back().unwrap_or(&0.0);
 
-            Plot::new("dgpu_plot")
-                .height(130.0)
-                .include_y(0.0)
-                .include_y(100.0)
-                .y_axis_label("% Used")
-                .allow_zoom(false)
-                .allow_drag(false)
-                .set_margin_fraction(egui::Vec2::new(0.0, 0.05))
-                .show(ui, |plot_ui| {
-                    plot_ui.line(dgpu_line);
+                let fmt_net = |kbs: f64| -> String {
+                    if kbs >= 1024.0 {
+                        format!("{:.2} MB/s", kbs / 1024.0)
+                    } else {
+                        format!("{:.1} KB/s", kbs)
+                    }
+                };
+
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("\u{25bc} Download: {}", fmt_net(net_recv_now)))
+                            .size(18.0)
+                            .color(Color32::from_rgb(80, 220, 240)),
+                    );
+                    ui.add_space(24.0);
+                    ui.label(
+                        egui::RichText::new(format!("\u{25b2} Upload:   {}", fmt_net(net_sent_now)))
+                            .size(18.0)
+                            .color(Color32::from_rgb(240, 130, 200)),
+                    );
                 });
+                ui.add_space(6.0);
 
+                let window = self.history_length.min(self.net_recv_history.len());
+                let skip_r = self.net_recv_history.len() - window;
+                let net_recv_pts: PlotPoints = self.net_recv_history
+                    .iter().skip(skip_r).enumerate()
+                    .map(|(i, &v)| [i as f64, v])
+                    .collect();
+                let skip_s = self.net_sent_history.len().saturating_sub(window);
+                let net_sent_pts: PlotPoints = self.net_sent_history
+                    .iter().skip(skip_s).enumerate()
+                    .map(|(i, &v)| [i as f64, v])
+                    .collect();
+
+                let net_recv_line = Line::new(net_recv_pts)
+                    .color(Color32::from_rgb(80, 220, 240))
+                    .width(2.0)
+                    .name("Download");
+                let net_sent_line = Line::new(net_sent_pts)
+                    .color(Color32::from_rgb(240, 130, 200))
+                    .width(2.0)
+                    .name("Upload");
+
+                Plot::new("net_plot")
+                    .height(140.0)
+                    .include_y(0.0)
+                    .include_y(10.0)
+                    .y_axis_label("KB/s")
+                    .x_axis_label(x_label)
+                    .allow_zoom(false)
+                    .allow_drag(false)
+                    .allow_scroll(false)
+                    .set_margin_fraction(egui::Vec2::new(0.0, 0.05))
+                    .show(ui, |plot_ui| {
+                        plot_ui.line(net_recv_line);
+                        plot_ui.line(net_sent_line);
+                    });
+            });
+            ui.add_space(8.0);
+
+            // ── iGPU CARD ─────────────────────────────────────────────────
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                let igpu_util = *self.igpu_history.back().unwrap_or(&0.0);
+                ui.heading(
+                    egui::RichText::new(format!("GPU  —  Intel iGPU  —  {:.1}%", igpu_util))
+                        .size(16.0)
+                        .color(Color32::from_rgb(100, 180, 255)),
+                );
+                ui.add_space(6.0);
+
+                let window = self.history_length.min(self.igpu_history.len());
+                let skip = self.igpu_history.len() - window;
+                let igpu_pts: PlotPoints = self.igpu_history
+                    .iter().skip(skip).enumerate()
+                    .map(|(i, &v)| [i as f64, v])
+                    .collect();
+
+                let igpu_line = Line::new(igpu_pts)
+                    .color(Color32::from_rgb(100, 180, 255))
+                    .width(2.0);
+
+                Plot::new("igpu_plot")
+                    .height(140.0)
+                    .include_y(0.0)
+                    .include_y(100.0)
+                    .y_axis_label("% Used")
+                    .x_axis_label(x_label)
+                    .allow_zoom(false)
+                    .allow_drag(false)
+                    .allow_scroll(false)
+                    .set_margin_fraction(egui::Vec2::new(0.0, 0.05))
+                    .show(ui, |plot_ui| {
+                        plot_ui.line(igpu_line);
+                    });
+            });
+            ui.add_space(8.0);
+
+            // ── dGPU CARD ─────────────────────────────────────────────────
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                let dgpu_util = *self.dgpu_history.back().unwrap_or(&0.0);
+                ui.heading(
+                    egui::RichText::new(format!("GPU  —  Discrete (NVIDIA/AMD)  —  {:.1}%", dgpu_util))
+                        .size(16.0)
+                        .color(Color32::from_rgb(120, 200, 140)),
+                );
+                ui.add_space(6.0);
+
+                let window = self.history_length.min(self.dgpu_history.len());
+                let skip = self.dgpu_history.len() - window;
+                let dgpu_pts: PlotPoints = self.dgpu_history
+                    .iter().skip(skip).enumerate()
+                    .map(|(i, &v)| [i as f64, v])
+                    .collect();
+
+                let dgpu_line = Line::new(dgpu_pts)
+                    .color(Color32::from_rgb(120, 200, 140))
+                    .width(2.0);
+
+                Plot::new("dgpu_plot")
+                    .height(140.0)
+                    .include_y(0.0)
+                    .include_y(100.0)
+                    .y_axis_label("% Used")
+                    .x_axis_label(x_label)
+                    .allow_zoom(false)
+                    .allow_drag(false)
+                    .allow_scroll(false)
+                    .set_margin_fraction(egui::Vec2::new(0.0, 0.05))
+                    .show(ui, |plot_ui| {
+                        plot_ui.line(dgpu_line);
+                    });
+            });
             ui.add_space(8.0);
             }); // end ScrollArea
         });
