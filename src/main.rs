@@ -38,12 +38,17 @@
 // ---------------------------------------------------------------------------
 // In Rust, `use` is like `import` in JavaScript/TypeScript.
 // We bring names into scope so we don't have to type the full path every time.
-use eframe::egui;                     // The immediate-mode GUI widgets
-use egui::Color32;                    // RGB color type
+use eframe::egui;                        // The immediate-mode GUI widgets
+use egui::Color32;                       // RGB color type
 use egui_plot::{Line, Plot, PlotPoints}; // The graphing widgets
-use std::collections::VecDeque;       // Double-ended queue — explained below
-use std::time::{Duration, Instant};   // Monotonic clock, like performance.now() in JS
-use sysinfo::System;                  // Wraps Windows system APIs
+use std::collections::VecDeque;          // Double-ended queue — explained below
+use std::time::{Duration, Instant};      // Monotonic clock, like performance.now() in JS
+use sysinfo::System;                     // Wraps Windows system APIs
+// Disks is a separate handle from System in sysinfo 0.30. The library splits
+// disk stats out so you only pay the cost of querying them when you ask.
+// Under the hood on Windows this calls DeviceIoControl with IOCTL_DISK_PERFORMANCE
+// to read per-disk I/O counters — the same source Task Manager uses.
+use sysinfo::Disks;
 
 // ---------------------------------------------------------------------------
 // WHAT IS A VecDeque?
@@ -103,6 +108,34 @@ struct SystemMonitor {
 
     // Maximum number of data points to keep. 60 = last 60 seconds at 1 Hz.
     history_length: usize,
+
+    // ── DISK I/O ────────────────────────────────────────────────────────────
+    // sysinfo::Disks is a dedicated handle for querying disk statistics.
+    // It is separate from System because disk I/O polling is relatively expensive —
+    // separating it lets you refresh disks independently of CPU/RAM.
+    disks: Disks,
+
+    // Read and write rate histories for C: and D: drives, stored in MB/s.
+    // We track read and write separately so both lines can appear on the same graph,
+    // just like Task Manager shows two lines per drive in its Disk section.
+    disk_c_read_history:  VecDeque<f64>, // C: drive read  MB/s history
+    disk_c_write_history: VecDeque<f64>, // C: drive write MB/s history
+    disk_d_read_history:  VecDeque<f64>, // D: drive read  MB/s history
+    disk_d_write_history: VecDeque<f64>, // D: drive write MB/s history
+
+    // Previous cumulative byte counters for each drive.
+    //
+    // sysinfo reports TOTAL bytes read/written since boot (a monotonically
+    // increasing counter — like a car odometer). To convert that to a RATE
+    // (MB per second), we subtract the previous snapshot from the current one:
+    //     rate_MB_s = (current_bytes - prev_bytes) / elapsed_seconds / 1024² 
+    //
+    // This is the same delta technique used by all system monitors:
+    // Task Manager, Resource Monitor, and perfmon all compute rates this way.
+    disk_c_prev_read:  u64,
+    disk_c_prev_write: u64,
+    disk_d_prev_read:  u64,
+    disk_d_prev_write: u64,
 }
 
 impl SystemMonitor {
@@ -116,7 +149,7 @@ impl SystemMonitor {
         // REFRESH_CPU_ALL: enables CPU usage tracking
         // REFRESH_MEMORY:  enables RAM tracking
         let mut system = System::new_with_specifics(
-            sysinfo::RefreshKind::new()
+            sysinfo::RefreshKind::nothing()
                 .with_cpu(sysinfo::CpuRefreshKind::everything())
                 .with_memory(sysinfo::MemoryRefreshKind::everything()),
         );
@@ -131,6 +164,16 @@ impl SystemMonitor {
         std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
         system.refresh_all();
 
+        // Initialise the disk handle and do a first refresh so we have a baseline
+        // byte counter to subtract from on the very next 1-second tick.
+        // new_with_refreshed_list() calls DeviceIoControl for each disk immediately.
+        let mut disks = Disks::new_with_refreshed_list();
+        disks.refresh(false); // second pass to seed the I/O counters
+
+        // Seed the "previous" counters from the initial read so the first delta
+        // on the first 1-second tick is meaningful rather than equal to bytes-since-boot.
+        let (c_r0, c_w0, d_r0, d_w0) = Self::sample_disk_bytes(&disks);
+
         SystemMonitor {
             system,
             cpu_history: VecDeque::with_capacity(60), // pre-allocate for 60 items
@@ -140,7 +183,44 @@ impl SystemMonitor {
             // waiting one second for the first reading.
             last_update: Instant::now() - Duration::from_secs(1),
             history_length: 60,
+            disks,
+            disk_c_read_history:  VecDeque::with_capacity(60),
+            disk_c_write_history: VecDeque::with_capacity(60),
+            disk_d_read_history:  VecDeque::with_capacity(60),
+            disk_d_write_history: VecDeque::with_capacity(60),
+            disk_c_prev_read:  c_r0,
+            disk_c_prev_write: c_w0,
+            disk_d_prev_read:  d_r0,
+            disk_d_prev_write: d_w0,
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    // HELPER: extract CUMULATIVE byte counters for C: and D: from the Disks list.
+    // Returns (c_read_total, c_write_total, d_read_total, d_write_total) in bytes.
+    //
+    // We use total_read_bytes() / total_written_bytes() (bytes since boot) rather
+    // than read_bytes() / written_bytes() (bytes since last refresh) so that our
+    // explicit delta calculation is the one source of truth for the rate.
+    // This matches how Task Manager and perfmon compute disk throughput.
+    //
+    // mount_point() on Windows returns a Path like "C:\" or "D:\".  We call
+    // to_string_lossy() to get a &str and check the drive letter prefix.
+    // ---------------------------------------------------------------------------
+    fn sample_disk_bytes(disks: &Disks) -> (u64, u64, u64, u64) {
+        let (mut c_r, mut c_w) = (0u64, 0u64);
+        let (mut d_r, mut d_w) = (0u64, 0u64);
+        for disk in disks.list() {
+            let mp = disk.mount_point().to_string_lossy().to_uppercase();
+            if mp.starts_with("C:") {
+                c_r = disk.usage().total_read_bytes;
+                c_w = disk.usage().total_written_bytes;
+            } else if mp.starts_with("D:") {
+                d_r = disk.usage().total_read_bytes;
+                d_w = disk.usage().total_written_bytes;
+            }
+        }
+        (c_r, c_w, d_r, d_w)
     }
 
     // Polls the OS for fresh CPU and memory data and pushes it into our history.
@@ -153,10 +233,10 @@ impl SystemMonitor {
         // Refresh memory counters. sysinfo calls GlobalMemoryStatusEx() again.
         self.system.refresh_memory();
 
-        // global_cpu_info() returns a Cpu struct representing the aggregate "all cores" CPU.
-        // Calling .cpu_usage() on it gives the average usage % across ALL logical cores.
+        // global_cpu_usage() returns a f32 representing the average usage % across ALL
+        // logical cores. In sysinfo 0.33+, this is a direct f32 value (no .cpu_usage() call).
         // Example: if you have 8 cores and average utilization is 25%, this returns 25.0.
-        let cpu_pct = self.system.global_cpu_info().cpu_usage() as f64;
+        let cpu_pct = self.system.global_cpu_usage() as f64;
 
         // used_memory() / total_memory() both return kilobytes (KB) as u64.
         // We convert to a percentage so the graph Y-axis matches the CPU graph (0–100).
@@ -179,6 +259,45 @@ impl SystemMonitor {
         }
         if self.mem_history.len() > self.history_length {
             self.mem_history.pop_front();
+        }
+
+        // ── DISK I/O REFRESH ────────────────────────────────────────────────
+        // disks.refresh(false) calls DeviceIoControl(IOCTL_DISK_PERFORMANCE) for each
+        // disk and updates the cumulative read_bytes / written_bytes counters.
+        // The bool arg: false = don't remove disks that have disappeared (safe for most cases).
+        self.disks.refresh(false);
+
+        // Read the new cumulative counters.
+        let (c_r, c_w, d_r, d_w) = Self::sample_disk_bytes(&self.disks);
+
+        // Compute deltas: bytes transferred since the last 1-second tick.
+        // saturating_sub prevents underflow if a counter ever wraps or resets
+        // (rare but possible after system sleep/resume on some drivers).
+        // Divide by 1024² to convert bytes → megabytes (MB/s at 1 Hz polling).
+        let c_read_mbs  = c_r.saturating_sub(self.disk_c_prev_read)  as f64 / (1024.0 * 1024.0);
+        let c_write_mbs = c_w.saturating_sub(self.disk_c_prev_write) as f64 / (1024.0 * 1024.0);
+        let d_read_mbs  = d_r.saturating_sub(self.disk_d_prev_read)  as f64 / (1024.0 * 1024.0);
+        let d_write_mbs = d_w.saturating_sub(self.disk_d_prev_write) as f64 / (1024.0 * 1024.0);
+
+        // Store current counters as the baseline for the next tick.
+        self.disk_c_prev_read  = c_r;
+        self.disk_c_prev_write = c_w;
+        self.disk_d_prev_read  = d_r;
+        self.disk_d_prev_write = d_w;
+
+        // Push rates into the sliding-window histories.
+        Self::push_history(&mut self.disk_c_read_history,  c_read_mbs,  self.history_length);
+        Self::push_history(&mut self.disk_c_write_history, c_write_mbs, self.history_length);
+        Self::push_history(&mut self.disk_d_read_history,  d_read_mbs,  self.history_length);
+        Self::push_history(&mut self.disk_d_write_history, d_write_mbs, self.history_length);
+    }
+
+    // Small reusable helper: push a value onto a VecDeque and pop the oldest
+    // entry if the deque has grown beyond the desired window length.
+    fn push_history(deque: &mut VecDeque<f64>, value: f64, max_len: usize) {
+        deque.push_back(value);
+        if deque.len() > max_len {
+            deque.pop_front();
         }
     }
 }
@@ -287,6 +406,9 @@ impl eframe::App for SystemMonitor {
         //   <div style="width:100%; height:100%; display:flex; flex-direction:column;">
         // The closure receives a `ui` handle — the drawing context for this panel.
         egui::CentralPanel::default().show(ctx, |ui| {
+            // ScrollArea lets the user scroll vertically when the window is too
+            // short to show all graphs at once — like overflow-y: auto in CSS.
+            egui::ScrollArea::vertical().show(ui, |ui| {
             // Add some breathing room around all content, like CSS padding.
             ui.add_space(8.0);
 
@@ -389,6 +511,142 @@ impl eframe::App for SystemMonitor {
                 .show(ui, |plot_ui| {
                     plot_ui.line(mem_line);
                 });
+
+            ui.add_space(16.0);
+            ui.separator();
+            ui.add_space(16.0);
+
+            // ── DISK C: SECTION ───────────────────────────────────────────────
+            // Each disk section shows two lines on one graph:
+            //   orange = read rate   (data coming FROM the disk INTO RAM)
+            //   red    = write rate  (data going FROM RAM TO the disk)
+            // This matches the Task Manager disk view which overlays both on one chart.
+            //
+            // The Y-axis auto-scales to the data (no fixed 0–100 cap) because disk
+            // speeds vary wildly: an NVMe SSD can burst to 3000+ MB/s while an
+            // HDD tops out at ~150 MB/s. include_y(0.0) anchors the bottom;
+            // include_y(1.0) ensures the chart never collapses to a flat line at idle.
+            ui.heading(
+                egui::RichText::new("Disk C:  —  I/O Rate")
+                    .size(16.0)
+                    .color(Color32::from_rgb(255, 180, 80)), // orange
+            );
+            ui.add_space(4.0);
+
+            let c_read_now  = *self.disk_c_read_history.back().unwrap_or(&0.0);
+            let c_write_now = *self.disk_c_write_history.back().unwrap_or(&0.0);
+
+            // Two separate colored labels so it's immediately clear which is which.
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("Read:  {:.2} MB/s", c_read_now))
+                        .size(18.0)
+                        .color(Color32::from_rgb(255, 180, 80)), // orange
+                );
+                ui.add_space(24.0);
+                ui.label(
+                    egui::RichText::new(format!("Write: {:.2} MB/s", c_write_now))
+                        .size(18.0)
+                        .color(Color32::from_rgb(220, 80, 80)), // red
+                );
+            });
+            ui.add_space(6.0);
+
+            // Build PlotPoints for both lines from the same iteration index.
+            let c_read_pts: PlotPoints = self.disk_c_read_history
+                .iter().enumerate()
+                .map(|(i, &v)| [i as f64, v])
+                .collect();
+            let c_write_pts: PlotPoints = self.disk_c_write_history
+                .iter().enumerate()
+                .map(|(i, &v)| [i as f64, v])
+                .collect();
+
+            let c_read_line  = Line::new(c_read_pts)
+                .color(Color32::from_rgb(255, 180, 80)) // orange
+                .width(2.0)
+                .name("Read");
+            let c_write_line = Line::new(c_write_pts)
+                .color(Color32::from_rgb(220, 80, 80))  // red
+                .width(2.0)
+                .name("Write");
+
+            Plot::new("disk_c_plot")
+                .height(130.0)
+                .include_y(0.0)
+                .include_y(1.0)  // minimum range so idle drives don't show a flat graph
+                .y_axis_label("MB/s")
+                .allow_zoom(false)
+                .allow_drag(false)
+                .set_margin_fraction(egui::Vec2::new(0.0, 0.05))
+                .show(ui, |plot_ui| {
+                    plot_ui.line(c_read_line);
+                    plot_ui.line(c_write_line);
+                });
+
+            ui.add_space(16.0);
+            ui.separator();
+            ui.add_space(16.0);
+
+            // ── DISK D: SECTION ───────────────────────────────────────────────
+            ui.heading(
+                egui::RichText::new("Disk D:  —  I/O Rate")
+                    .size(16.0)
+                    .color(Color32::from_rgb(255, 220, 80)), // yellow-orange
+            );
+            ui.add_space(4.0);
+
+            let d_read_now  = *self.disk_d_read_history.back().unwrap_or(&0.0);
+            let d_write_now = *self.disk_d_write_history.back().unwrap_or(&0.0);
+
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("Read:  {:.2} MB/s", d_read_now))
+                        .size(18.0)
+                        .color(Color32::from_rgb(255, 220, 80)), // yellow-orange
+                );
+                ui.add_space(24.0);
+                ui.label(
+                    egui::RichText::new(format!("Write: {:.2} MB/s", d_write_now))
+                        .size(18.0)
+                        .color(Color32::from_rgb(180, 100, 220)), // purple
+                );
+            });
+            ui.add_space(6.0);
+
+            let d_read_pts: PlotPoints = self.disk_d_read_history
+                .iter().enumerate()
+                .map(|(i, &v)| [i as f64, v])
+                .collect();
+            let d_write_pts: PlotPoints = self.disk_d_write_history
+                .iter().enumerate()
+                .map(|(i, &v)| [i as f64, v])
+                .collect();
+
+            let d_read_line  = Line::new(d_read_pts)
+                .color(Color32::from_rgb(255, 220, 80))  // yellow-orange
+                .width(2.0)
+                .name("Read");
+            let d_write_line = Line::new(d_write_pts)
+                .color(Color32::from_rgb(180, 100, 220)) // purple
+                .width(2.0)
+                .name("Write");
+
+            Plot::new("disk_d_plot")
+                .height(130.0)
+                .include_y(0.0)
+                .include_y(1.0)
+                .y_axis_label("MB/s")
+                .allow_zoom(false)
+                .allow_drag(false)
+                .set_margin_fraction(egui::Vec2::new(0.0, 0.05))
+                .show(ui, |plot_ui| {
+                    plot_ui.line(d_read_line);
+                    plot_ui.line(d_write_line);
+                });
+
+            ui.add_space(8.0);
+            }); // end ScrollArea
         });
 
         // ---------------------------------------------------------------------------
@@ -425,7 +683,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("System Monitor")      // Title bar text
-            .with_inner_size([880.0, 620.0])   // Initial window size in logical pixels
+            .with_inner_size([900.0, 820.0])   // Initial window size in logical pixels
             .with_min_inner_size([400.0, 300.0]) // Minimum resize boundary
             .with_resizable(true),             // Allow the user to drag window edges
         ..Default::default() // All other options use safe defaults
