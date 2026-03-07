@@ -1,0 +1,22 @@
+[package]
+name = "sys-monitor"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sys-monitor"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.27"
+egui = "0.27"
+egui_plot = "0.27"
+sysinfo = "0.33"
+wmi = "0.13"
+windows = { version = "0.52", features = ["Win32_System_Performance", "Win32_Foundation"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
