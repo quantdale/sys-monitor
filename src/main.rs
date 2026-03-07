@@ -41,7 +41,7 @@
 use eframe::egui;                        // The immediate-mode GUI widgets
 use egui::Color32;                       // RGB color type
 use egui_plot::{Line, Plot, PlotPoints}; // The graphing widgets
-use std::collections::VecDeque;          // Double-ended queue — explained below
+use std::collections::{HashMap, VecDeque}; // Double-ended queue + maps for per-disk history
 use std::time::{Duration, Instant};      // Monotonic clock, like performance.now() in JS
 use sysinfo::System;                     // Wraps Windows system APIs
 // Disks is a separate handle from System in sysinfo 0.30. The library splits
@@ -155,27 +155,16 @@ struct SystemMonitor {
     // separating it lets you refresh disks independently of CPU/RAM.
     disks: Disks,
 
-    // Read and write rate histories for C: and D: drives, stored in MB/s.
-    // We track read and write separately so both lines can appear on the same graph,
-    // just like Task Manager shows two lines per drive in its Disk section.
-    disk_c_read_history:  VecDeque<f64>, // C: drive read  MB/s history
-    disk_c_write_history: VecDeque<f64>, // C: drive write MB/s history
-    disk_d_read_history:  VecDeque<f64>, // D: drive read  MB/s history
-    disk_d_write_history: VecDeque<f64>, // D: drive write MB/s history
-
-    // Previous cumulative byte counters for each drive.
+    // Per-physical-disk active-time history (%), keyed by drive-letter group
+    // such as "C:" or "C: D:". Values are always in the 0.0-100.0 range.
     //
-    // sysinfo reports TOTAL bytes read/written since boot (a monotonically
-    // increasing counter — like a car odometer). To convert that to a RATE
-    // (MB per second), we subtract the previous snapshot from the current one:
-    //     rate_MB_s = (current_bytes - prev_bytes) / elapsed_seconds / 1024² 
-    //
-    // This is the same delta technique used by all system monitors:
-    // Task Manager, Resource Monitor, and perfmon all compute rates this way.
-    disk_c_prev_read:  u64,
-    disk_c_prev_write: u64,
-    disk_d_prev_read:  u64,
-    disk_d_prev_write: u64,
+    // Why % active time instead of MB/s throughput:
+    //   - Sequential I/O can produce high MB/s with low busy time (fast NVMe)
+    //   - Random 4K I/O can pin the disk at 100% busy with low MB/s
+    // % Disk Time measures the fraction of elapsed time with pending requests,
+    // which is the utilization metric Task Manager's disk graph displays.
+    disk_active_histories: HashMap<String, VecDeque<f64>>,
+    disk_display_order: Vec<String>,
 
     // ── NETWORK I/O ──────────────────────────────────────────────────────────
     // Networks is a HashMap<String, NetworkData> under the hood — each key is
@@ -278,6 +267,7 @@ struct SystemMonitor {
     pdh_gpu_3d_counter: Option<isize>,    // \GPU Engine(*engtype_3D*)\Utilization Percentage
     #[allow(dead_code)] // stored for future VideoDecode UI display; not yet read
     pdh_gpu_video_counter: Option<isize>, // \GPU Engine(*engtype_VideoDecode*)\Utilization Percentage
+    pdh_disk_active_counter: Option<isize>, // \PhysicalDisk(*)\% Idle Time  (inverted → active%)
 }
 
 impl SystemMonitor {
@@ -306,15 +296,10 @@ impl SystemMonitor {
         std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
         system.refresh_all();
 
-        // Initialise the disk handle and do a first refresh so we have a baseline
-        // byte counter to subtract from on the very next 1-second tick.
-        // new_with_refreshed_list() calls DeviceIoControl for each disk immediately.
+        // Initialize the disk handle for mount-point metadata (drive-letter mapping).
+        // Disk utilization itself comes from PDH % Disk Time, not sysinfo byte deltas.
         let mut disks = Disks::new_with_refreshed_list();
-        disks.refresh(false); // second pass to seed the I/O counters
-
-        // Seed the "previous" counters from the initial read so the first delta
-        // on the first 1-second tick is meaningful rather than equal to bytes-since-boot.
-        let (c_r0, c_w0, d_r0, d_w0) = Self::sample_disk_bytes(&disks);
+        disks.refresh(false);
 
         // Initialise the Networks handle.
         // new_with_refreshed_list() calls GetIfTable2() immediately to discover all
@@ -331,10 +316,15 @@ impl SystemMonitor {
         // enabling PDH to maintain its internal baseline for rate computation.
         // new_pdh_gpu_query() also makes a first PdhCollectQueryData call to
         // establish the baseline; real readings start on the second poll (~1s later).
-        let (pdh_query, pdh_gpu_3d_counter, pdh_gpu_video_counter) =
+        let (
+            pdh_query,
+            pdh_gpu_3d_counter,
+            pdh_gpu_video_counter,
+            pdh_disk_active_counter,
+        ) =
             match new_pdh_gpu_query() {
-                Some((q, c3d, cvid)) => (Some(q), Some(c3d), cvid),
-                None => (None, None, None),
+                Some((q, c3d, cvid, cdisk)) => (Some(q), Some(c3d), cvid, cdisk),
+                None => (None, None, None, None),
             };
 
         SystemMonitor {
@@ -353,14 +343,8 @@ impl SystemMonitor {
             max_history: 3600,        // buffer cap: 1 hour (3600 seconds)
             selected_duration: 60,    // default selected time range: 1 minute
             disks,
-            disk_c_read_history:  VecDeque::with_capacity(3600),
-            disk_c_write_history: VecDeque::with_capacity(3600),
-            disk_d_read_history:  VecDeque::with_capacity(3600),
-            disk_d_write_history: VecDeque::with_capacity(3600),
-            disk_c_prev_read:  c_r0,
-            disk_c_prev_write: c_w0,
-            disk_d_prev_read:  d_r0,
-            disk_d_prev_write: d_w0,
+            disk_active_histories: HashMap::new(),
+            disk_display_order: Vec::new(),
             networks,
             net_recv_history: VecDeque::with_capacity(3600),
             net_sent_history: VecDeque::with_capacity(3600),
@@ -397,35 +381,99 @@ impl SystemMonitor {
             pdh_query,
             pdh_gpu_3d_counter,
             pdh_gpu_video_counter,
+            pdh_disk_active_counter,
         }
     }
 
-    // ---------------------------------------------------------------------------
-    // HELPER: extract CUMULATIVE byte counters for C: and D: from the Disks list.
-    // Returns (c_read_total, c_write_total, d_read_total, d_write_total) in bytes.
-    //
-    // We use total_read_bytes() / total_written_bytes() (bytes since boot) rather
-    // than read_bytes() / written_bytes() (bytes since last refresh) so that our
-    // explicit delta calculation is the one source of truth for the rate.
-    // This matches how Task Manager and perfmon compute disk throughput.
-    //
-    // mount_point() on Windows returns a Path like "C:\" or "D:\".  We call
-    // to_string_lossy() to get a &str and check the drive letter prefix.
-    // ---------------------------------------------------------------------------
-    fn sample_disk_bytes(disks: &Disks) -> (u64, u64, u64, u64) {
-        let (mut c_r, mut c_w) = (0u64, 0u64);
-        let (mut d_r, mut d_w) = (0u64, 0u64);
-        for disk in disks.list() {
-            let mp = disk.mount_point().to_string_lossy().to_uppercase();
-            if mp.starts_with("C:") {
-                c_r = disk.usage().total_read_bytes;
-                c_w = disk.usage().total_written_bytes;
-            } else if mp.starts_with("D:") {
-                d_r = disk.usage().total_read_bytes;
-                d_w = disk.usage().total_written_bytes;
+    // PhysicalDisk instance names look like "0 C: D:" (disk index + drive letters).
+    // One physical disk can have multiple partitions, so one instance may include
+    // multiple drive letters. If there are no drive letters (system/unformatted
+    // partition), this returns an empty list and the caller skips that instance.
+    fn pdh_instance_to_drive_letters(instance: &str) -> Vec<String> {
+        instance
+            .split_whitespace()
+            .skip(1) // skip the leading disk index token (e.g. "0")
+            .filter(|token| token.ends_with(':'))
+            .map(|token| token.to_uppercase())
+            .collect()
+    }
+
+    // Read per-instance \PhysicalDisk(*)\% Idle Time values from PDH and invert.
+    // Returns map of raw PDH instance name -> active time percent (0.0-100.0).
+    // active% = 100 - idle%  — same value Task Manager's disk graph displays.
+    fn query_disk_active_time(&mut self) -> HashMap<String, f64> {
+        let counter = match self.pdh_disk_active_counter {
+            Some(c) => c,
+            None => return HashMap::new(),
+        };
+
+        // SAFETY: PDH API calls use valid handles and stack-owned output pointers.
+        unsafe {
+            let mut buffer_size: u32 = 0;
+            let mut item_count: u32 = 0;
+
+            // Wildcard counters return multiple instances, so we must use
+            // PdhGetFormattedCounterArrayW (not the single-value API).
+            // First call probes required buffer size/item count.
+            let _ = PdhGetFormattedCounterArrayW(
+                counter,
+                PDH_FMT_DOUBLE,
+                &mut buffer_size,
+                &mut item_count,
+                None,
+            );
+
+            if buffer_size == 0 || item_count == 0 {
+                return HashMap::new();
             }
+
+            // Second call fills the caller-provided array. The required byte count
+            // includes both item structs and trailing instance-name storage, so we
+            // must allocate by byte size (not just item_count * struct size).
+            // Vec<u64> guarantees 8-byte alignment needed by the embedded f64 union.
+            let u64_count = (buffer_size as usize * 3 + 7) / 8;
+            let mut backing: Vec<u64> = vec![0u64; u64_count];
+            let mut actual_buf_size: u32 = (u64_count * 8) as u32;
+            let buf_ptr = backing.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_W;
+
+            let status = PdhGetFormattedCounterArrayW(
+                counter,
+                PDH_FMT_DOUBLE,
+                &mut actual_buf_size,
+                &mut item_count,
+                Some(buf_ptr),
+            );
+
+            if status != 0 {
+                return HashMap::new();
+            }
+
+            let mut result = HashMap::new();
+            for i in 0..item_count as usize {
+                let item: &PDH_FMT_COUNTERVALUE_ITEM_W = &*buf_ptr.add(i);
+
+                if item.FmtValue.CStatus > 1 {
+                    continue;
+                }
+
+                let name = item.szName.to_string().unwrap_or_default();
+
+                // _Total is the aggregate over all physical disks. We skip it because
+                // the UI shows one graph card per physical disk instance.
+                if name == "_Total" {
+                    continue;
+                }
+
+                // % Idle Time is the fraction of elapsed time the disk had NO pending I/O.
+                // Inverting gives % active time (= % busy), which matches Task Manager's
+                // disk graph. PDH can briefly emit out-of-range values near baseline startup;
+                // clamp keeps the result physically meaningful (0-100).
+                let value = (100.0 - item.FmtValue.Anonymous.doubleValue).clamp(0.0, 100.0);
+                result.insert(name, value);
+            }
+
+            result
         }
-        (c_r, c_w, d_r, d_w)
     }
 
     // Polls the OS for fresh CPU and memory data and pushes it into our history.
@@ -467,36 +515,6 @@ impl SystemMonitor {
             self.mem_history.pop_front();
         }
 
-        // ── DISK I/O REFRESH ────────────────────────────────────────────────
-        // disks.refresh(false) calls DeviceIoControl(IOCTL_DISK_PERFORMANCE) for each
-        // disk and updates the cumulative read_bytes / written_bytes counters.
-        // The bool arg: false = don't remove disks that have disappeared (safe for most cases).
-        self.disks.refresh(false);
-
-        // Read the new cumulative counters.
-        let (c_r, c_w, d_r, d_w) = Self::sample_disk_bytes(&self.disks);
-
-        // Compute deltas: bytes transferred since the last 1-second tick.
-        // saturating_sub prevents underflow if a counter ever wraps or resets
-        // (rare but possible after system sleep/resume on some drivers).
-        // Divide by 1024² to convert bytes → megabytes (MB/s at 1 Hz polling).
-        let c_read_mbs  = c_r.saturating_sub(self.disk_c_prev_read)  as f64 / (1024.0 * 1024.0);
-        let c_write_mbs = c_w.saturating_sub(self.disk_c_prev_write) as f64 / (1024.0 * 1024.0);
-        let d_read_mbs  = d_r.saturating_sub(self.disk_d_prev_read)  as f64 / (1024.0 * 1024.0);
-        let d_write_mbs = d_w.saturating_sub(self.disk_d_prev_write) as f64 / (1024.0 * 1024.0);
-
-        // Store current counters as the baseline for the next tick.
-        self.disk_c_prev_read  = c_r;
-        self.disk_c_prev_write = c_w;
-        self.disk_d_prev_read  = d_r;
-        self.disk_d_prev_write = d_w;
-
-        // Push rates into the sliding-window histories (capped at max_history, not history_length).
-        Self::push_history(&mut self.disk_c_read_history,  c_read_mbs,  self.max_history);
-        Self::push_history(&mut self.disk_c_write_history, c_write_mbs, self.max_history);
-        Self::push_history(&mut self.disk_d_read_history,  d_read_mbs,  self.max_history);
-        Self::push_history(&mut self.disk_d_write_history, d_write_mbs, self.max_history);
-
         // ── NETWORK I/O REFRESH ─────────────────────────────────────────────
         // networks.refresh(false) calls GetIfEntry2() for each interface.
         // After this call, received() and transmitted() on each NetworkData
@@ -531,6 +549,52 @@ impl SystemMonitor {
 
         Self::push_history(&mut self.net_recv_history, recv_kbs, self.max_history);
         Self::push_history(&mut self.net_sent_history, sent_kbs, self.max_history);
+
+        // ── DISK + GPU UTILIZATION REFRESH (SHARED PDH SNAPSHOT) ───────────
+        // Collect once per poll on the shared PDH query so GPU and disk counters
+        // are sampled from the same timestamped snapshot. We do not open a second
+        // query for disk because PDH baselines are query-handle scoped.
+        let pdh_collected_ok = match self.pdh_query {
+            Some(query) => unsafe { PdhCollectQueryData(query) == 0 },
+            None => false,
+        };
+
+        if pdh_collected_ok {
+            self.disks.refresh(false);
+
+            // Build drive-letter lookup from sysinfo mount points to map PDH
+            // instance labels (e.g. "0 C: D:") onto currently mounted volumes.
+            let mut known_drive_letters: HashMap<String, String> = HashMap::new();
+            for disk in self.disks.list() {
+                let mount = disk.mount_point().to_string_lossy().to_string();
+                let mount_upper = mount.to_uppercase();
+                if mount_upper.len() >= 2 && mount_upper.as_bytes()[1] == b':' {
+                    known_drive_letters.insert(mount_upper[..2].to_string(), mount);
+                }
+            }
+
+            for (instance_name, pct_active) in self.query_disk_active_time() {
+                let mapped_letters: Vec<String> = Self::pdh_instance_to_drive_letters(&instance_name)
+                    .into_iter()
+                    .filter(|letter| known_drive_letters.contains_key(letter))
+                    .collect();
+
+                if mapped_letters.is_empty() {
+                    continue;
+                }
+
+                let disk_key = mapped_letters.join(" ");
+                if !self.disk_active_histories.contains_key(&disk_key) {
+                    self.disk_display_order.push(disk_key.clone());
+                    self.disk_active_histories
+                        .insert(disk_key.clone(), VecDeque::with_capacity(3600));
+                }
+
+                if let Some(history) = self.disk_active_histories.get_mut(&disk_key) {
+                    Self::push_history(history, pct_active, self.max_history);
+                }
+            }
+        }
 
         // ── GPU UTILIZATION REFRESH ──────────────────────────────────────────
         // Query PDH for GPU Engine utilization. Uses PDH (Performance Data Helper)
@@ -878,7 +942,7 @@ impl SystemMonitor {
     //
     // PDH LIFECYCLE SUMMARY (see struct fields for full explanation):
     //   PdhOpenQuery (once) → PdhAddEnglishCounter (once) → every poll:
-    //     PdhCollectQueryData → PdhGetFormattedCounterArrayW → read values
+    //     PdhCollectQueryData (in refresh_metrics) → read arrays for disk/GPU
     //
     // WHY unsafe:
     //   PDH is a C Win32 API. Rust's `unsafe` block is required at any FFI
@@ -889,13 +953,12 @@ impl SystemMonitor {
     // WHY FIRST POLL RETURNS 0%:
     //   PDH computes utilization as: (value₂ − value₁) / time_delta.
     //   The first PdhCollectQueryData (called in new_pdh_gpu_query at startup)
-    //   establishes value₁ (the baseline). This function's first call computes
-    //   the first real delta. Identical to Task Manager showing 0 on first second.
+    //   establishes value₁ (the baseline). The next poll computes the first real
+    //   delta. Identical to Task Manager showing 0 on first second.
     fn query_gpu_utilization_pdh(&mut self) -> (f64, f64) {
-        let query = match self.pdh_query {
-            Some(q) => q,
-            None => return (0.0, 0.0), // PDH init failed at startup
-        };
+        if self.pdh_query.is_none() {
+            return (0.0, 0.0); // PDH init failed at startup
+        }
         let counter_3d = match self.pdh_gpu_3d_counter {
             Some(c) => c,
             None => return (0.0, 0.0),
@@ -926,18 +989,6 @@ impl SystemMonitor {
         //   • szName pointers in PDH_FMT_COUNTERVALUE_ITEM_W point into the same
         //     backing buffer, which stays alive for the duration of this unsafe block
         unsafe {
-            // Collect a fresh sample — PDH computes (new − old) / time_delta internally.
-            // This gives us the rate since the previous PdhCollectQueryData call.
-            // On the very first call after PdhOpenQuery the baseline is set; real
-            // percentages start appearing from the second call onward.
-            if PdhCollectQueryData(query) != 0 {
-                if !self.gpu_error_logged {
-                    eprintln!("[PDH] PdhCollectQueryData failed — GPU readings unavailable.");
-                    self.gpu_error_logged = true;
-                }
-                return (0.0, 0.0);
-            }
-
             // --- Probe call: determine the required buffer size ---
             // PdhGetFormattedCounterArrayW with a null instance buffer returns
             // PDH_MORE_DATA (a "failure") but populates buf_size and item_count.
@@ -1066,11 +1117,12 @@ impl SystemMonitor {
 // PDH INITIALIZATION HELPER
 // ---------------------------------------------------------------------------
 
-/// Open a PDH query and register GPU engine utilization counters once at startup.
+/// Open a PDH query and register GPU + disk utilization counters once at startup.
 ///
-/// Returns `Some((query, counter_3d, counter_video_opt))` on success.
+/// Returns `Some((query, counter_3d, counter_video_opt, counter_disk_opt))` on success.
 /// Returns `None` if the query or 3D counter cannot be opened (GPU tracking disabled).
 /// `counter_video_opt` is `None` if the VideoDecode counter is unavailable (non-fatal).
+/// `counter_disk_opt` is `None` if % Disk Time is unavailable (non-fatal).
 ///
 /// **Why open once:**
 ///   PDH rate-based counters (Win32_PerfFormattedData_* counters) track utilization as
@@ -1084,7 +1136,7 @@ impl SystemMonitor {
 ///   call to C code because the Rust compiler cannot verify the safety of foreign code.
 ///   Here we ensure safety manually: all pointer arguments are valid stack variables or
 ///   properly aligned heap allocations, and we check all return codes.
-fn new_pdh_gpu_query() -> Option<(isize, isize, Option<isize>)> {
+fn new_pdh_gpu_query() -> Option<(isize, isize, Option<isize>, Option<isize>)> {
     // SAFETY: PDH C API calls via FFI. All mutable pointer arguments are stack variables.
     // Return codes are checked before any output values are read.
     unsafe {
@@ -1135,6 +1187,30 @@ fn new_pdh_gpu_query() -> Option<(isize, isize, Option<isize>)> {
                 None
             };
 
+        // Disk % Idle Time counter. Added to the SAME query as GPU so one
+        // PdhCollectQueryData call snapshots both domains atomically and reuses
+        // the same baseline state. Opening a second query would add drift and
+        // duplicate rate baselines unnecessarily.
+        //
+        // We use % Idle Time rather than % Disk Time / % Disk Active Time because
+        // % Idle Time is reliably present on all Windows 10/11 configurations while
+        // % Disk Active Time can be absent on some storage drivers. Active time is
+        // computed as: active% = 100 - idle%.  Values are inverted in query_disk_active_time.
+        //
+        // PhysicalDisk instance names look like:
+        //   "0 C: D:"  (disk index + one/more mounted drive letters)
+        //   "_Total"    (aggregate over all physical disks)
+        // We ignore _Total in UI and render per-disk cards instead.
+        let path_disk_active = windows::core::w!(r"\PhysicalDisk(*)\% Idle Time");
+        let mut counter_disk_active: isize = 0;
+        let counter_disk_opt =
+            if PdhAddEnglishCounterW(query, path_disk_active, 0, &mut counter_disk_active) == 0 {
+                Some(counter_disk_active)
+            } else {
+                eprintln!("[PDH] Failed to add disk idle time counter.");
+                None
+            };
+
         // First PdhCollectQueryData — establishes the sample baseline.
         // This call stores value₁ for every matched instance. The NEXT call
         // (first actual poll ~1 second after app start) will compute value₂ − value₁
@@ -1142,8 +1218,8 @@ fn new_pdh_gpu_query() -> Option<(isize, isize, Option<isize>)> {
         // The first call always "returns" 0% — this is correct, not a bug.
         let _ = PdhCollectQueryData(query);
 
-        eprintln!("[PDH] GPU counters initialized successfully.");
-        Some((query, counter_3d, counter_video_opt))
+        eprintln!("[PDH] GPU/disk counters initialized successfully.");
+        Some((query, counter_3d, counter_video_opt, counter_disk_opt))
     }
 }
 
@@ -1491,136 +1567,67 @@ impl eframe::App for SystemMonitor {
             });
             ui.add_space(8.0);
 
-            // ── DISK C: CARD ───────────────────────────────────────────────
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.heading(
-                    egui::RichText::new("Disk C:  —  I/O Rate")
-                        .size(16.0)
-                        .color(Color32::from_rgb(255, 180, 80)),
-                );
-                ui.add_space(4.0);
+            // ── DISK CARDS (PER PHYSICAL DISK) ──────────────────────────────
+            let disk_palette = [
+                Color32::from_rgb(255, 180, 80),
+                Color32::from_rgb(255, 220, 80),
+                Color32::from_rgb(220, 120, 80),
+                Color32::from_rgb(240, 190, 120),
+            ];
 
-                let c_read_now  = *self.disk_c_read_history.back().unwrap_or(&0.0);
-                let c_write_now = *self.disk_c_write_history.back().unwrap_or(&0.0);
+            for (idx, disk_key) in self.disk_display_order.iter().enumerate() {
+                let Some(history) = self.disk_active_histories.get(disk_key) else {
+                    continue;
+                };
 
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("Read:  {:.2} MB/s", c_read_now))
-                            .size(18.0)
-                            .color(Color32::from_rgb(255, 180, 80)),
+                let color = disk_palette[idx % disk_palette.len()];
+
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.heading(
+                        egui::RichText::new(format!("Disk {}  —  Active Time", disk_key))
+                            .size(16.0)
+                            .color(color),
                     );
-                    ui.add_space(24.0);
+                    ui.add_space(4.0);
+
+                    let active_now = *history.back().unwrap_or(&0.0);
                     ui.label(
-                        egui::RichText::new(format!("Write: {:.2} MB/s", c_write_now))
+                        egui::RichText::new(format!("Active Time: {:.1}%", active_now))
                             .size(18.0)
-                            .color(Color32::from_rgb(220, 80, 80)),
+                            .color(color),
                     );
+                    ui.add_space(6.0);
+
+                    let window = self.history_length.min(history.len());
+                    let skip = history.len().saturating_sub(window);
+                    let points: PlotPoints = history
+                        .iter()
+                        .skip(skip)
+                        .enumerate()
+                        .map(|(i, &v)| [i as f64, v])
+                        .collect();
+
+                    let line = Line::new(points).color(color).width(2.0).name("Active Time");
+
+                    // Y-axis is always 0-100 because % active time is a time fraction,
+                    // not a throughput value. No rated speed detection is needed.
+                    // This matches Task Manager's disk active-time graph semantics.
+                    Plot::new(format!("disk_active_plot_{}", disk_key))
+                        .height(140.0)
+                        .include_y(0.0)
+                        .include_y(100.0)
+                        .y_axis_label("Active Time %")
+                        .x_axis_label(x_label)
+                        .allow_zoom(false)
+                        .allow_drag(false)
+                        .allow_scroll(false)
+                        .set_margin_fraction(egui::Vec2::new(0.0, 0.05))
+                        .show(ui, |plot_ui| {
+                            plot_ui.line(line);
+                        });
                 });
-                ui.add_space(6.0);
-
-                // Slice the last `history_length` points for display.
-                let window = self.history_length.min(self.disk_c_read_history.len());
-                let skip_r = self.disk_c_read_history.len() - window;
-                let c_read_pts: PlotPoints = self.disk_c_read_history
-                    .iter().skip(skip_r).enumerate()
-                    .map(|(i, &v)| [i as f64, v])
-                    .collect();
-                let skip_w = self.disk_c_write_history.len().saturating_sub(window);
-                let c_write_pts: PlotPoints = self.disk_c_write_history
-                    .iter().skip(skip_w).enumerate()
-                    .map(|(i, &v)| [i as f64, v])
-                    .collect();
-
-                let c_read_line  = Line::new(c_read_pts)
-                    .color(Color32::from_rgb(255, 180, 80))
-                    .width(2.0)
-                    .name("Read");
-                let c_write_line = Line::new(c_write_pts)
-                    .color(Color32::from_rgb(220, 80, 80))
-                    .width(2.0)
-                    .name("Write");
-
-                Plot::new("disk_c_plot")
-                    .height(140.0)
-                    .include_y(0.0)
-                    .include_y(1.0)
-                    .y_axis_label("MB/s")
-                    .x_axis_label(x_label)
-                    .allow_zoom(false)
-                    .allow_drag(false)
-                    .allow_scroll(false)
-                    .set_margin_fraction(egui::Vec2::new(0.0, 0.05))
-                    .show(ui, |plot_ui| {
-                        plot_ui.line(c_read_line);
-                        plot_ui.line(c_write_line);
-                    });
-            });
-            ui.add_space(8.0);
-
-            // ── DISK D: CARD ───────────────────────────────────────────────
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.heading(
-                    egui::RichText::new("Disk D:  —  I/O Rate")
-                        .size(16.0)
-                        .color(Color32::from_rgb(255, 220, 80)),
-                );
-                ui.add_space(4.0);
-
-                let d_read_now  = *self.disk_d_read_history.back().unwrap_or(&0.0);
-                let d_write_now = *self.disk_d_write_history.back().unwrap_or(&0.0);
-
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("Read:  {:.2} MB/s", d_read_now))
-                            .size(18.0)
-                            .color(Color32::from_rgb(255, 220, 80)),
-                    );
-                    ui.add_space(24.0);
-                    ui.label(
-                        egui::RichText::new(format!("Write: {:.2} MB/s", d_write_now))
-                            .size(18.0)
-                            .color(Color32::from_rgb(180, 100, 220)),
-                    );
-                });
-                ui.add_space(6.0);
-
-                let window = self.history_length.min(self.disk_d_read_history.len());
-                let skip_r = self.disk_d_read_history.len() - window;
-                let d_read_pts: PlotPoints = self.disk_d_read_history
-                    .iter().skip(skip_r).enumerate()
-                    .map(|(i, &v)| [i as f64, v])
-                    .collect();
-                let skip_w = self.disk_d_write_history.len().saturating_sub(window);
-                let d_write_pts: PlotPoints = self.disk_d_write_history
-                    .iter().skip(skip_w).enumerate()
-                    .map(|(i, &v)| [i as f64, v])
-                    .collect();
-
-                let d_read_line  = Line::new(d_read_pts)
-                    .color(Color32::from_rgb(255, 220, 80))
-                    .width(2.0)
-                    .name("Read");
-                let d_write_line = Line::new(d_write_pts)
-                    .color(Color32::from_rgb(180, 100, 220))
-                    .width(2.0)
-                    .name("Write");
-
-                Plot::new("disk_d_plot")
-                    .height(140.0)
-                    .include_y(0.0)
-                    .include_y(1.0)
-                    .y_axis_label("MB/s")
-                    .x_axis_label(x_label)
-                    .allow_zoom(false)
-                    .allow_drag(false)
-                    .allow_scroll(false)
-                    .set_margin_fraction(egui::Vec2::new(0.0, 0.05))
-                    .show(ui, |plot_ui| {
-                        plot_ui.line(d_read_line);
-                        plot_ui.line(d_write_line);
-                    });
-            });
-            ui.add_space(8.0);
+                ui.add_space(8.0);
+            }
 
             // ── NETWORK CARD ──────────────────────────────────────────────
             egui::Frame::group(ui.style()).show(ui, |ui| {
