@@ -1,0 +1,5 @@
+# Universal Planner → Executor Handoff
+
+This additive protocol preserves stricter repository rules. The planner writes the next major campaign to `.agent/EXECUTION_PROMPT.md` after auditing actual code, tests, docs, recent commits/diffs, useful issues/PRs, and native agent/state files. The prompt records Status, Planned-From, Planned-At, Target-Branch, mission, findings, scope, ordered workstreams, constraints, tests/integration validation, acceptance criteria, completion gate, Git requirements, and final reporting. Planning ends after committing/pushing the planning-only change.
+
+For `/goal continue` or equivalent: read repository instructions, this file, `.agent/EXECUTION_PROMPT.md` if present, and native campaign/state files; reconcile with current Git and implementation; resume an ACTIVE prompt from the first genuinely incomplete requirement, preserving existing behavior and avoiding unrelated rewrites; validate, repair introduced Critical/High regressions, update durable state, and commit/push per repository policy. If no active planner prompt exists, fall back to native continuation semantics; if neither exists, report that a planner pass is required.
