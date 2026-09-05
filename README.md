@@ -1,20 +1,28 @@
-# sys-monitor
+# sys-monitor — deprecated snapshot
 
-A native Windows system monitoring application built in Rust.
-Displays real-time CPU and memory usage with scrolling graphs.
+> **Deprecated:** this repository is retained as historical/source reference. New system-monitor development is maintained in [`quantdale/monitorers`](https://github.com/quantdale/monitorers). Do not start new feature work here unless a task explicitly targets this legacy implementation.
 
-## Stack
+This repository contains an older native Windows system-monitor implementation in Rust, including CPU, memory, disk, network, and GPU monitoring code plus legacy/experimental monitor trees.
+
+## Legacy stack
 
 - Rust
-- egui / eframe (immediate mode GUI)
-- sysinfo (system metrics)
+- egui / eframe for the native UI
+- `sysinfo` plus Windows-specific metric/platform code
 
-## How to run
+## Historical run/build commands
 
+From the repository root:
+
+```bash
 cargo run
-
-## How to build a standalone .exe
-
 cargo build --release
+```
 
-# Output: target/release/sys-monitor.exe
+The release binary is produced under `target/release/` when the legacy project still builds in the current toolchain/environment.
+
+These commands are documented for maintenance and archaeology only. Their presence is not a fresh build certification.
+
+## Agent and maintenance notes
+
+Read `AGENTS.md` and `.agent/STATE.md` before changing anything. Preserve this repository as a truthful legacy snapshot: fix documentation, security issues, or specifically requested legacy defects when necessary, but do not silently back-port active `monitorers` development or present this repository as the current product.
